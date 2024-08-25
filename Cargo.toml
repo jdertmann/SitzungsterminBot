@@ -1,0 +1,16 @@
+[package]
+name = "sitzungsterminbot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+chrono-tz = "0.9"
+env_logger = "0.11"
+reqwest = "0.12"
+tokio = { version = "1.39", features = ["rt", "macros", "rt-multi-thread", "sync"] }
+scraper = "0.20"
+teloxide = { version = "0.13", features = ["macros"] }
+log = "0.4"
+thiserror="1"
+tokio-stream = { version = "0.1", features = ["sync"] }
