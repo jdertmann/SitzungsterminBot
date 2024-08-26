@@ -5,6 +5,7 @@ use chrono::prelude::*;
 use chrono_tz::Europe;
 use reqwest;
 use scraper::{selectable::Selectable, ElementRef, Html, Selector};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::task::spawn_blocking;
 
@@ -16,7 +17,7 @@ pub enum Error {
     ParseError(Cow<'static, str>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Session {
     pub date: NaiveDate,
     pub time: String,
@@ -134,7 +135,7 @@ async fn parse_table(url: &str, date: NaiveDate) -> Result<Vec<Session>, Error> 
 
 pub type Schedule = Vec<Session>;
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CourtInfo {
     pub full_name: String,
     pub schedule: Schedule,

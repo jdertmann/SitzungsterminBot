@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"
 env_logger = "0.11"
 reqwest = "0.12"
@@ -12,5 +12,10 @@ tokio = { version = "1.39", features = ["rt", "macros", "rt-multi-thread", "sync
 scraper = "0.20"
 teloxide = { version = "0.13", features = ["macros"] }
 log = "0.4"
+redis = { version = "0.26", features = ["tokio-comp", "json"] }
+regex = "1.10"
+serde = "1"
+serde_json = "*"
+shlex = "1.3"
 thiserror="1"
 tokio-stream = { version = "0.1", features = ["sync"] }
