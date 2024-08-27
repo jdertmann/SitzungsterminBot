@@ -1,21 +1,18 @@
 mod database;
 
-use std::{
-    hash::{DefaultHasher, Hash, Hasher},
-    time::Duration,
-};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::Duration;
 
 use chrono::prelude::*;
+use database::Database;
 use redis::RedisResult;
 use serde::{Deserialize, Serialize};
 use teloxide::types::ChatId;
-use tokio::{
-    sync::mpsc,
-    time::{interval_at, Instant, MissedTickBehavior},
-};
+use tokio::sync::mpsc;
+use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
-use crate::{chat_list::ChatData, messages, scraper, MessageSender};
-use database::Database;
+use crate::chat_list::ChatData;
+use crate::{messages, scraper, MessageSender};
 
 pub const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(8, 0, 0);
 
@@ -46,7 +43,6 @@ struct Subscription {
     chat_id: ChatId,
     reference: String,
 }
-
 
 struct CourtWorker {
     name: String,

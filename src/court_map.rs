@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use regex::Regex;
-use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 
-use crate::{court::Court, MessageSender};
+use crate::court::Court;
+use crate::MessageSender;
 
 type Map = HashMap<String, Court>;
 

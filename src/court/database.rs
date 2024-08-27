@@ -53,7 +53,7 @@ impl Database {
         loop {
             let result = match self.get_connection().await {
                 Ok(mut conn) => operation(&mut conn).await,
-                Err(e) => Err(e)
+                Err(e) => Err(e),
             };
 
             match result {

@@ -9,13 +9,10 @@ use std::time::Duration;
 use chat_list::ChatData;
 // use chat_list::ChatData;
 use court_map::CourtMap;
-use teloxide::{
-    macros::BotCommands,
-    prelude::*,
-    types::{MessageId, ReplyParameters},
-    utils::command::ParseError,
-};
-
+use teloxide::macros::BotCommands;
+use teloxide::prelude::*;
+use teloxide::types::{MessageId, ReplyParameters};
+use teloxide::utils::command::ParseError;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
