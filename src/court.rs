@@ -1,11 +1,12 @@
+mod database;
+
 use std::{
-    collections::{BTreeMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     time::Duration,
 };
 
 use chrono::prelude::*;
-use redis::{AsyncCommands, RedisResult};
+use redis::RedisResult;
 use serde::{Deserialize, Serialize};
 use teloxide::types::ChatId;
 use tokio::{
@@ -14,6 +15,7 @@ use tokio::{
 };
 
 use crate::{chat_list::ChatData, messages, scraper, MessageSender};
+use database::Database;
 
 pub const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(8, 0, 0);
 
@@ -45,110 +47,6 @@ struct Subscription {
     reference: String,
 }
 
-type RedisConnection = redis::aio::MultiplexedConnection;
-
-#[derive(Debug, Clone)]
-struct Database {
-    redis: redis::Client,
-    name: String,
-    redis_conn: Option<RedisConnection>,
-}
-
-impl Database {
-    fn new(client: redis::Client, court_name: &str) -> Self {
-        Self {
-            redis: client,
-            name: court_name.to_string(),
-            redis_conn: None,
-        }
-    }
-
-    fn court_info_key(&self) -> String {
-        format!("court:{}:info", self.name)
-    }
-
-    fn sub_key(&self) -> String {
-        format!("court:{}:subs", self.name)
-    }
-
-    async fn get_connection(&mut self) -> RedisResult<RedisConnection> {
-        if let Some(conn) = &self.redis_conn {
-            Ok(conn.clone())
-        } else {
-            let conn = self.redis.get_multiplexed_async_connection().await?;
-            self.redis_conn = Some(conn.clone());
-            Ok(conn)
-        }
-    }
-
-    async fn load_court_state(&mut self) -> RedisResult<Option<CourtState>> {
-        let mut conn = self.get_connection().await?;
-        let info_str: Option<String> = conn.get(self.court_info_key()).await?;
-
-        let info = match info_str {
-            Some(info_str) => Some(serde_json::from_str(&info_str)?),
-            None => None,
-        };
-
-        Ok(info)
-    }
-
-    async fn save_court_state(&mut self, info: &CourtState) -> RedisResult<()> {
-        let mut conn = self.get_connection().await?;
-        let info_str = serde_json::to_string(info).expect("Couldn't serialize");
-        conn.set(self.court_info_key(), info_str).await?;
-        Ok(())
-    }
-
-    async fn load_subscriptions(&mut self) -> RedisResult<HashSet<Subscription>> {
-        let mut conn = self.get_connection().await?;
-
-        let map: BTreeMap<String, String> = conn.hgetall(&self.sub_key()).await?;
-
-        let mut subscriptions = HashSet::new();
-
-        for (k, reference) in map {
-            let Some((chat_id, name)) = k.split_once(':') else {
-                log::info!("Invalid subscription key in database, skipping");
-                continue;
-            };
-
-            let Ok(chat_id) = chat_id.parse() else {
-                log::info!("Invalid subscription key in database, skipping");
-                continue;
-            };
-
-            subscriptions.insert(Subscription {
-                chat_id: ChatId(chat_id),
-                name: name.to_string(),
-                reference: reference,
-            });
-        }
-
-        Ok(subscriptions)
-    }
-
-    async fn save_subscription(&mut self, sub: &Subscription) -> RedisResult<()> {
-        let mut conn = self.get_connection().await?;
-        conn.hset(
-            self.sub_key(),
-            format!("{}:{}", sub.chat_id.0, sub.name),
-            &sub.reference,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    async fn remove_subscription(&mut self, name: &str, chat_id: ChatId) -> RedisResult<usize> {
-        let mut conn = self.get_connection().await?;
-        let n: usize = conn
-            .hdel(self.sub_key(), format!("{}:{}", chat_id.0, name))
-            .await?;
-
-        Ok(n)
-    }
-}
 
 struct CourtWorker {
     name: String,
