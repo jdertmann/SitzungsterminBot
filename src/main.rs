@@ -7,11 +7,13 @@ mod scraper;
 use std::time::Duration;
 
 use chat_list::ChatData;
+use chrono::{DateTime, Utc};
 // use chat_list::ChatData;
 use court_map::CourtMap;
 use teloxide::{
     macros::BotCommands,
     prelude::*,
+    types::{MessageId, ReplyParameters},
     utils::command::{BotCommands as _, ParseError},
 };
 
@@ -20,23 +22,29 @@ use tokio::sync::mpsc;
 
 #[derive(Clone)]
 struct MessageSender {
-    queue: mpsc::UnboundedSender<(ChatId, String)>,
+    queue: mpsc::UnboundedSender<(ChatId, String, Option<MessageId>)>,
     direct: Bot,
 }
 
 impl MessageSender {
-    async fn send_inner(bot: &Bot, chat_id: ChatId, msg: String) {
-        let result = bot
+    async fn send_inner(bot: &Bot, chat_id: ChatId, msg: String, reply_to: Option<MessageId>) {
+        let mut result = bot
             .send_message(chat_id, msg)
-            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-            .await;
+            .parse_mode(teloxide::types::ParseMode::MarkdownV2);
+
+        if let Some(reply_to) = reply_to {
+            result = result.reply_parameters(ReplyParameters::new(reply_to));
+        }
+
+        let result = result.await;
 
         if let Err(e) = result {
             log::warn!("Couldn't send message to {chat_id}: {e}")
         }
     }
+
     fn new(bot: Bot) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(ChatId, String)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(ChatId, String, Option<MessageId>)>();
         let direct = bot.clone();
         tokio::task::spawn(async move {
             let mut buffer = Vec::with_capacity(20);
@@ -46,8 +54,8 @@ impl MessageSender {
 
             loop {
                 rx.recv_many(&mut buffer, 20).await;
-                for (c, s) in buffer.iter() {
-                    Self::send_inner(&bot, *c, s.to_string()).await;
+                for (c, s, m) in buffer.iter() {
+                    Self::send_inner(&bot, *c, s.to_string(), *m).await;
                 }
                 buffer.clear();
                 interval.tick().await;
@@ -57,12 +65,12 @@ impl MessageSender {
         Self { queue: tx, direct }
     }
 
-    fn send(&self, chat_id: ChatId, msg: String) {
-        let _ = self.queue.send((chat_id, msg));
+    fn send(&self, chat_id: ChatId, msg: String, reply_to: Option<MessageId>) {
+        let _ = self.queue.send((chat_id, msg, reply_to));
     }
 
-    async fn send_direct(&self, chat_id: ChatId, msg: String) {
-        Self::send_inner(&self.direct, chat_id, msg).await;
+    async fn send_direct(&self, chat_id: ChatId, msg: String, reply_to: Option<MessageId>) {
+        Self::send_inner(&self.direct, chat_id, msg, reply_to).await;
     }
 }
 
@@ -130,6 +138,7 @@ async fn main() {
     let notification_queue = MessageSender::new(bot.clone());
     let redis = redis::Client::open("redis://127.0.0.1/").unwrap();
     let court_map = CourtMap::new(notification_queue, redis);
+
     //let chat_data : Arc<RwLock<HashMap<ChatId, ChatData>>> = Default::default();
 
     let answer = move |bot: Bot, msg: Message, cmd: Command| {
@@ -137,34 +146,42 @@ async fn main() {
         //let chat_data = chat_data.clone();
         async move {
             log::info!("{:?}", cmd);
-
+            let chat_id = msg.chat.id;
+            macro_rules! get_court {
+                ($court:expr) => {
+                    match court_map.get(&$court).await {
+                        Some(x) => x,
+                        None => {
+                            bot.send_message(msg.chat.id, "Ungültiger Gerichtsname!")
+                                .reply_parameters(ReplyParameters::new(msg.id))
+                                .await?;
+                            return Ok(());
+                        }
+                    }
+                };
+            }
             match cmd {
                 Command::Help => {
-                    let response = Command::descriptions().to_string();
-                    bot.send_message(msg.chat.id, response).await?;
+                    bot.send_message(msg.chat.id, HELP_MESSAGE)
+                        .reply_parameters(ReplyParameters::new(msg.id))
+                        .await?;
                 }
                 Command::Subscribe {
                     name,
                     court,
                     reference,
-                } => court_map.get(&court).await.add_subscription(
-                    ChatData::new(msg.chat.id),
-                    name,
-                    reference,
-                ),
+                } => {
+                    get_court!(court).add_subscription(msg, ChatData::new(chat_id), name, reference)
+                }
                 Command::Unsubscribe { name } => {
-                    todo!(); //court_manager.get(&court).await.remove_subscription(msg.chat.id, Some(name), true);
+                    todo!(); //get_court!(court).remove_subscription(msg.chat.id, Some(name), true);
                 }
                 Command::GetSessions {
                     court,
                     date,
                     reference,
-                } => court_map.get(&court).await.get_sessions(
-                    ChatData::new(msg.chat.id),
-                    date,
-                    reference,
-                ),
-                Command::ForceUpdate { court } => court_map.get(&court).await.update(true),
+                } => get_court!(court).get_sessions(msg, ChatData::new(chat_id), date, reference),
+                Command::ForceUpdate { court } => get_court!(court).update(true),
             }
             Ok(())
         }
@@ -172,3 +189,19 @@ async fn main() {
 
     Command::repl(bot, answer).await;
 }
+
+const HELP_MESSAGE : &str = "
+Unterstützte Befehle:
+/help
+/get_sessions <Gericht> <Datum> <Aktenzeichen>
+/subscribe <beliebiger Name> <Gericht> <Aktenzeichen>
+
+Wenn ein Parameter Leerzeichen enthält, muss er in Anführungszeichen gesetzt werden.
+
+Der Name des Gerichts muss sein wie in der URL der Website, also z.B. \"vg-koeln\".
+
+Das Datum kann auch \"*\" sein, um jedes Datum zu erfassen.
+
+Im Aktenzeichen steht \"?\" für ein beliebiges einzelnes Zeichen,  \"*\" für eine beliebige Zeichenkette.
+
+Keine Gewähr für verpasste Termine!";

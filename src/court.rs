@@ -1,18 +1,23 @@
+use std::{
+    collections::{BTreeMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
+    time::Duration,
+};
+
 use chrono::prelude::*;
 use redis::{AsyncCommands, RedisResult};
 use serde::{Deserialize, Serialize};
 use teloxide::types::ChatId;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::mpsc,
+    time::{interval_at, Instant, MissedTickBehavior},
+};
 
 use crate::{chat_list::ChatData, messages, scraper, MessageSender};
 
-fn is_out_of_date(last_update: Option<DateTime<Utc>>) -> bool {
-    const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(7, 5, 0);
+pub const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(8, 0, 0);
 
-    let Some(last_update) = last_update else {
-        return false;
-    };
-
+fn is_out_of_date(last_update: DateTime<Utc>) -> bool {
     let now = Utc::now().with_timezone(&chrono_tz::Europe::Berlin);
 
     let date = if now.time() < TRESHOLD_TIME {
@@ -37,231 +42,284 @@ fn is_out_of_date(last_update: Option<DateTime<Utc>>) -> bool {
 struct Subscription {
     name: String,
     chat_id: ChatId,
-    reference: String
-}
-
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CourtState {
-    court_info: Result<scraper::CourtInfo, ()>,
-    last_update: Option<DateTime<Utc>>,
-    subscriptions: Vec<Subscription>,
+    reference: String,
 }
 
 type RedisConnection = redis::aio::MultiplexedConnection;
-struct StateManager {
+
+#[derive(Debug, Clone)]
+struct Database {
     redis: redis::Client,
-    redis_key: String,
+    name: String,
     redis_conn: Option<RedisConnection>,
-    non_persistent_mode: bool,
 }
 
-impl StateManager {
+impl Database {
     fn new(client: redis::Client, court_name: &str) -> Self {
         Self {
             redis: client,
-            redis_key: format!("court_state:{court_name}"),
+            name: court_name.to_string(),
             redis_conn: None,
-            non_persistent_mode: false
         }
+    }
+
+    fn court_info_key(&self) -> String {
+        format!("court:{}:info", self.name)
+    }
+
+    fn sub_key(&self) -> String {
+        format!("court:{}:subs", self.name)
     }
 
     async fn get_connection(&mut self) -> RedisResult<RedisConnection> {
-        if self.redis_conn.is_some() {
-            Ok(self.redis_conn.as_ref().unwrap().clone())
+        if let Some(conn) = &self.redis_conn {
+            Ok(conn.clone())
         } else {
             let conn = self.redis.get_multiplexed_async_connection().await?;
-            Ok(self.redis_conn.insert(conn).clone())
+            self.redis_conn = Some(conn.clone());
+            Ok(conn)
         }
     }
 
-    async fn load_state_inner(&mut self) -> RedisResult<Option<CourtState>> {
+    async fn load_court_state(&mut self) -> RedisResult<Option<CourtState>> {
         let mut conn = self.get_connection().await?;
-        let state_str: Option<String> = conn.get(&self.redis_key).await?;
-        let state = match state_str {
-            Some(state_str) => Some(serde_json::from_str(&state_str)?),
-            None => None
+        let info_str: Option<String> = conn.get(self.court_info_key()).await?;
+
+        let info = match info_str {
+            Some(info_str) => Some(serde_json::from_str(&info_str)?),
+            None => None,
         };
-        Ok(state)
-    }
-    async fn load_state(&mut self) -> RedisResult<Option<CourtState>> {
-        self.load_state_inner()
-            .await
-            .inspect_err(|e| log::warn!("Redis error while loading state: {e}"))
+
+        Ok(info)
     }
 
-    async fn save_state_inner(&mut self, state: &CourtState) -> RedisResult<()> {
+    async fn save_court_state(&mut self, info: &CourtState) -> RedisResult<()> {
         let mut conn = self.get_connection().await?;
-        let state_str = serde_json::to_string(state).expect("Serialization failed");
-        conn.set(&self.redis_key, state_str).await?;
+        let info_str = serde_json::to_string(info).expect("Couldn't serialize");
+        conn.set(self.court_info_key(), info_str).await?;
         Ok(())
     }
 
-    async fn save_state(&mut self, state: &CourtState) -> RedisResult<()> {
-        if self.non_persistent_mode {
-            log::info!("Didn't save court state due to non-persistance mode");
-            return Ok(());
+    async fn load_subscriptions(&mut self) -> RedisResult<HashSet<Subscription>> {
+        let mut conn = self.get_connection().await?;
+
+        let map: BTreeMap<String, String> = conn.hgetall(&self.sub_key()).await?;
+
+        let mut subscriptions = HashSet::new();
+
+        for (k, reference) in map {
+            let Some((chat_id, name)) = k.split_once(':') else {
+                log::info!("Invalid subscription key in database, skipping");
+                continue;
+            };
+
+            let Ok(chat_id) = chat_id.parse() else {
+                log::info!("Invalid subscription key in database, skipping");
+                continue;
+            };
+
+            subscriptions.insert(Subscription {
+                chat_id: ChatId(chat_id),
+                name: name.to_string(),
+                reference: reference,
+            });
         }
-        self.save_state_inner(state)
-            .await
-            .inspect_err(|e| log::warn!("Redis error while saving state: {e}"))
+
+        Ok(subscriptions)
+    }
+
+    async fn save_subscription(&mut self, sub: &Subscription) -> RedisResult<()> {
+        let mut conn = self.get_connection().await?;
+        conn.hset(
+            self.sub_key(),
+            format!("{}:{}", sub.chat_id.0, sub.name),
+            &sub.reference,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn remove_subscription(&mut self, name: &str, chat_id: ChatId) -> RedisResult<usize> {
+        let mut conn = self.get_connection().await?;
+        let n: usize = conn
+            .hdel(self.sub_key(), format!("{}:{}", chat_id.0, name))
+            .await?;
+
+        Ok(n)
     }
 }
 
 struct CourtWorker {
     name: String,
-    state: Option<CourtState>,
     message_rx: mpsc::UnboundedReceiver<Message>,
+    auto_update: tokio::time::Interval,
     notify: MessageSender,
-    state_manager: StateManager,
+    database: Database,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+
+struct CourtState {
+    last_update: DateTime<Utc>,
+    info: Result<scraper::CourtInfo, ()>,
 }
 
 impl CourtWorker {
-    async fn update(&mut self, force: bool) -> &mut CourtState {
-        if let Some(state) = &self.state {
-            if !force && !is_out_of_date(state.last_update) {
-                // to make the borrow checker happy ...
-                return self.state.as_mut().unwrap();
+    async fn update_and_get(&mut self, force_update: bool) -> RedisResult<CourtState> {
+        log::info!("{}: Check for update", self.name);
+        let maybe_state = self.database.load_court_state().await?;
+
+        if let Some(state) = &maybe_state {
+            if !force_update && !is_out_of_date(state.last_update) {
+                return Ok(maybe_state.unwrap());
             }
         }
+        log::info!("{}: Running update", self.name);
+        let last_update = Utc::now(); // Better have last_update too old than too new
 
-        let last_update = Some(Utc::now()); // Better have last_update too old than too new
         let new_info: Result<_, ()> = scraper::get_court_info(&self.name)
             .await
             .map_err(|e| log::warn!("Failed to get info for court {}: {e}", &self.name));
 
-        match &mut self.state {
-            Some(state) => {
-                for sub in &state.subscriptions {
-                    let Some(msg) =
-                        messages::handle_update(&state.court_info, &new_info, &sub.name, &sub.reference)
-                    else {
-                        continue;
-                    };
-                    self.notify.send(sub.chat_id, msg);
-                }
+        let new_state = CourtState {
+            info: new_info,
+            last_update,
+        };
 
-                state.last_update = last_update;
-                state.court_info = new_info;
+        if Some(&new_state.info) != maybe_state.as_ref().map(|x| &x.info) {
+            let old_info = match maybe_state {
+                Some(state) => state.info,
+                None => Err(()),
+            };
 
-                let _ = self.state_manager.save_state(&state).await;
-
-                state
-            }
-            state => {
-                let new_state = CourtState {
-                    court_info: new_info,
-                    last_update,
-                    subscriptions: Vec::new(),
+            for sub in self.database.load_subscriptions().await? {
+                let Some(msg) =
+                    messages::handle_update(&old_info, &new_state.info, &sub.name, &sub.reference)
+                else {
+                    continue;
                 };
-
-                let _ = self.state_manager.save_state(&new_state).await;
-
-                state.insert(new_state)
+                self.notify.send(sub.chat_id, msg, None);
             }
         }
+
+        self.database.save_court_state(&new_state).await?;
+
+        Ok(new_state)
     }
 
     async fn handle_update(&mut self, force: bool) {
-        self.update(force).await;
+        let _ = self.update_and_get(force).await;
     }
 
-    async fn handle_get_sessions(&mut self, chat: ChatData, date: String, reference: String) {
-        let state = self.update(false).await;
+    async fn handle_get_sessions(
+        &mut self,
+        message: teloxide::types::Message,
+        chat: ChatData,
+        date: String,
+        reference: String,
+    ) {
+        let msg = match self.update_and_get(false).await {
+            Ok(state) => messages::list_sessions(&state.info, &reference, &date),
+            Err(e) => {
+                log::warn!("Failed to retrieve state: {e}");
+                messages::internal_error()
+            }
+        };
 
-        let msg = messages::list_sessions(&state.court_info, &reference, &date);
-        self.notify.send_direct(chat.get_id(), msg).await;
+        self.notify
+            .send_direct(chat.get_id(), msg, Some(message.id))
+            .await;
     }
 
-    async fn handle_add_subscription(&mut self, chat: ChatData, name: String, reference: String) {
-        if self.state_manager.non_persistent_mode {
-            self.notify.send_direct(chat.get_id(), messages::internal_error()).await;
+    async fn handle_add_subscription(
+        &mut self,
+        message: teloxide::types::Message,
+        chat: ChatData,
+        name: String,
+        reference: String,
+    ) {
+        let Ok(state) = self.update_and_get(false).await else {
+            self.notify
+                .send_direct(chat.get_id(), messages::internal_error(), Some(message.id))
+                .await;
             return;
-        }
-
-        self.update(false).await;
-        let state = self.state.as_mut().unwrap();
+        };
 
         let sub = Subscription {
             chat_id: chat.get_id(),
             name,
-            reference
+            reference,
         };
-    
-        state.subscriptions.push(sub.clone());
 
-        if let Err(_) = self.state_manager.save_state(state).await {
-            state.subscriptions.pop();
-            self.notify.send_direct(chat.get_id(), messages::internal_error()).await;
-            return;
-        }
+        let msg = match self.database.save_subscription(&sub).await {
+            Ok(()) => messages::subscribed(&sub.name, &state.info, &sub.reference),
+            Err(e) => {
+                log::warn!("Failed to save subscription: {e}");
+                messages::internal_error()
+            }
+        };
 
-        let msg = messages::subscribed(&sub.name, &state.court_info, &sub.reference);
-
-        self.notify.send_direct(chat.get_id(), msg).await;
+        self.notify
+            .send_direct(chat.get_id(), msg, Some(message.id))
+            .await;
     }
 
     async fn handle_remove_subscription(
         &mut self,
+        message: teloxide::types::Message,
         chat: ChatData,
-        name: Option<String>,
-        reply_to_bot: bool,
+        name: String,
     ) {
-        if self.state_manager.non_persistent_mode {
-            self.notify.send_direct(chat.get_id(), messages::internal_error()).await;
-            return;
-        }
-
-        let Some(state) = &mut self.state else {
-            return;
+        let msg = match self
+            .database
+            .remove_subscription(&name, chat.get_id())
+            .await
+        {
+            Ok(n) => messages::unsubscribed(n),
+            Err(e) => {
+                log::warn!("Failed to remove subscription: {e}");
+                messages::internal_error()
+            }
         };
 
-        let old_len = state.subscriptions.len();
-
-        state.subscriptions.retain(|sub| {
-            sub.chat_id != chat.get_id() || (name.is_some() && Some(&sub.name) != name.as_ref())
-        });
-
-        if let Err(_) = self.state_manager.save_state(state).await {
-            self.notify.send_direct(chat.get_id(), messages::internal_error()).await;
-            return;
-        }
-
-        if state.subscriptions.len() < old_len && reply_to_bot {
-            let msg = match name {
-                None => "Removed all subscriptions".to_string(),
-                Some(name) => format!("Removed subscription {name}"),
-            };
-            self.notify.send_direct(chat.get_id(), msg).await;
-        }
+        self.notify
+            .send_direct(chat.get_id(), msg, Some(message.id))
+            .await;
     }
 
     async fn run(mut self) {
-        match self.state_manager.load_state().await {
-            Ok(state) => self.state = state,
-            Err(_) => {self.state_manager.non_persistent_mode = true}
-        }
-
-        while let Some(msg) = self.message_rx.recv().await {
-            match msg {
-                Message::Update { force } => self.handle_update(force).await,
-                Message::GetSessions {
-                    chat,
-                    date,
-                    reference,
-                } => self.handle_get_sessions(chat, date, reference).await,
-                Message::AddSubscription {
-                    chat,
-                    name,
-                    reference,
-                } => self.handle_add_subscription(chat, name, reference).await,
-                Message::RemoveSubscription {
-                    chat,
-                    name,
-                    reply_to_bot,
-                } => {
-                    self.handle_remove_subscription(chat, name, reply_to_bot)
-                        .await
+        loop {
+            tokio::select! {
+                _ = self.auto_update.tick() => self.handle_update(false).await,
+                msg = self.message_rx.recv() => {
+                    let Some(msg) = msg else {break};
+                    match msg {
+                        Message::Update { force } => self.handle_update(force).await,
+                        Message::GetSessions {
+                            message,
+                            chat,
+                            date,
+                            reference,
+                        } => {
+                            self.handle_get_sessions(message, chat, date, reference)
+                                .await
+                        }
+                        Message::AddSubscription {
+                            message,
+                            chat,
+                            name,
+                            reference,
+                        } => {
+                            self.handle_add_subscription(message, chat, name, reference)
+                                .await
+                        }
+                        Message::RemoveSubscription {
+                            message,
+                            chat,
+                            name,
+                        } => self.handle_remove_subscription(message, chat, name).await,
+                    }
                 }
             }
         }
@@ -273,19 +331,21 @@ enum Message {
         force: bool,
     },
     GetSessions {
+        message: teloxide::types::Message,
         chat: ChatData,
         date: String,
         reference: String,
     },
     AddSubscription {
+        message: teloxide::types::Message,
         chat: ChatData,
         name: String,
         reference: String,
     },
     RemoveSubscription {
+        message: teloxide::types::Message,
         chat: ChatData,
-        name: Option<String>, // remove all if none
-        reply_to_bot: bool,
+        name: String,
     },
 }
 
@@ -297,15 +357,23 @@ pub struct Court {
 impl Court {
     pub fn new(name: String, notify: MessageSender, redis: redis::Client) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let state_manager = StateManager::new(redis, &name);
+        let database = Database::new(redis, &name);
+        let period = {
+            // to avoid peaks all 5 minutes, make the period "random"
+            let mut hash = DefaultHasher::new();
+            name.hash(&mut hash);
+            Duration::from_secs(270 + hash.finish() % 60)
+        };
+        let mut auto_update = interval_at(Instant::now() + period, period);
+        auto_update.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let worker = CourtWorker {
             name,
-            state: None,
             message_rx,
             notify,
-            state_manager
-                };
+            auto_update,
+            database,
+        };
 
         tokio::spawn(worker.run());
 
@@ -316,8 +384,15 @@ impl Court {
         let _ = self.message_tx.send(Message::Update { force });
     }
 
-    pub fn get_sessions(&self, chat: ChatData, date: String, reference: String) {
+    pub fn get_sessions(
+        &self,
+        message: teloxide::types::Message,
+        chat: ChatData,
+        date: String,
+        reference: String,
+    ) {
         let msg = Message::GetSessions {
+            message,
             chat,
             date,
             reference,
@@ -325,8 +400,15 @@ impl Court {
         let _ = self.message_tx.send(msg);
     }
 
-    pub fn add_subscription(&self, chat: ChatData, name: String, reference: String) {
+    pub fn add_subscription(
+        &self,
+        message: teloxide::types::Message,
+        chat: ChatData,
+        name: String,
+        reference: String,
+    ) {
         let msg = Message::AddSubscription {
+            message,
             chat,
             name,
             reference,
@@ -334,11 +416,16 @@ impl Court {
         let _ = self.message_tx.send(msg);
     }
 
-    pub fn remove_subscription(&self, chat: ChatData, name: Option<String>, reply_to_bot: bool) {
+    pub fn remove_subscription(
+        &self,
+        message: teloxide::types::Message,
+        chat: ChatData,
+        name: String,
+    ) {
         let msg = Message::RemoveSubscription {
+            message,
             chat,
             name,
-            reply_to_bot,
         };
         let _ = self.message_tx.send(msg);
     }

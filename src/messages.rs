@@ -147,6 +147,14 @@ pub fn subscribed(name: &str, court_info: &Result<CourtInfo, ()>, reference: &st
     result
 }
 
+pub fn unsubscribed(n: usize) -> String {
+    if n == 0 {
+        escape("Es wurde kein Abo mit dem Namen gefunden.")
+    } else {
+        escape("Abo wurde gelöscht 👍")
+    }
+}
+
 pub fn handle_update(
     old_info: &Result<CourtInfo, ()>,
     new_info: &Result<CourtInfo, ()>,
