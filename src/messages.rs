@@ -122,7 +122,6 @@ pub fn list_sessions(info: &Result<CourtInfo, ()>, reference: &str, date: &str) 
     }
 }
 
-
 pub fn subscribed(name: &str, court_info: &Result<CourtInfo, ()>, reference: &str) -> String {
     let mut result = escape(&format!("Dein Abo „{name}” wurde entgegengenommen."));
     match court_info {
@@ -131,14 +130,18 @@ pub fn subscribed(name: &str, court_info: &Result<CourtInfo, ()>, reference: &st
             let (count, list) = create_list(info, |session| reference.matches(&session.reference));
 
             match count {
-                0 => result += &escape(" Zur Zeit gibt es nichts zu melden, aber ich halt dich auf dem Laufenden!"),
+                0 => {
+                    result += &escape(
+                        " Zur Zeit gibt es nichts zu melden, aber ich halt dich auf dem Laufenden!",
+                    )
+                }
                 _ => {
                     result += &escape(" Hier schon mal eine Liste der anstehenden Termine:");
                     result += &list;
                     result += &escape("\n\nBei neuen Terminen werde ich dich benachrichtigen!");
                 }
             }
-        },
+        }
         Err(_) => {
             result += &escape(" Ich kann die Website des Gerichts leider nicht erreichen, aber ich halt dich auf dem Laufenden.");
         }

@@ -67,7 +67,7 @@ async fn parse_index_page(url_name: &str) -> Result<(String, Vec<(NaiveDate, Str
             .ok_or(Error::ParseError("invalid meta tag".into()))?
             .to_string();
 
-        let urls = document.select(&DATES_SELECTOR).filter_map(|elem| { 
+        let urls = document.select(&DATES_SELECTOR).filter_map(|elem| {
             let Some(date_unix) = elem.value().attr("value") else { return None };
             let date_unix : i64 = match date_unix.trim().parse() {
                 Ok(timestamp) => timestamp,

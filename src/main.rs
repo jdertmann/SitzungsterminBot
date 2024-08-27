@@ -7,14 +7,13 @@ mod scraper;
 use std::time::Duration;
 
 use chat_list::ChatData;
-use chrono::{DateTime, Utc};
 // use chat_list::ChatData;
 use court_map::CourtMap;
 use teloxide::{
     macros::BotCommands,
     prelude::*,
     types::{MessageId, ReplyParameters},
-    utils::command::{BotCommands as _, ParseError},
+    utils::command::ParseError,
 };
 
 use thiserror::Error;
