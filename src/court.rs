@@ -104,7 +104,7 @@ impl CourtWorker {
     }
 
     async fn handle_update(&mut self, force: bool) {
-        let _ = self.update_and_get(force).await;
+        let _ = self.update_and_get(force).await.inspect_err(|e| log::error!("Update failed: {e}"));
     }
 
     async fn handle_get_sessions(
