@@ -61,11 +61,12 @@ struct CourtState {
 
 impl CourtWorker {
     async fn update_and_get(&mut self, force_update: bool) -> RedisResult<CourtState> {
-        log::info!("{}: Check for update", self.name);
+        log::debug!("{}: Check for update", self.name);
         let maybe_state = self.database.load_court_state().await?;
 
         if let Some(state) = &maybe_state {
             if !force_update && !is_out_of_date(state.last_update) {
+                log::debug!("{}: Already up to date", self.name);
                 return Ok(maybe_state.unwrap());
             }
         }

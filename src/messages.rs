@@ -48,9 +48,9 @@ pub fn session_info(entry: &Session) -> String {
     let datetime = format!("{}, {}", entry.date.format("%A, %-d %B %C%y"), entry.time);
 
     let byline = if entry.lawsuit.is_empty() {
-        entry.type_.clone()
+        entry.r#type.clone()
     } else {
-        format!("{}, {}", entry.lawsuit, entry.type_)
+        format!("{}, {}", entry.lawsuit, entry.r#type)
     };
 
     let mut result = format!(

@@ -22,7 +22,7 @@ pub enum Error {
 pub struct Session {
     pub date: NaiveDate,
     pub time: String,
-    pub type_: String,
+    pub r#type: String,
     pub lawsuit: String,
     pub hall: String,
     pub reference: String,
@@ -102,7 +102,7 @@ fn parse_row(tr: ElementRef, date: NaiveDate) -> Session {
     Session {
         date,
         time: get_cell_content!("td.termDate"),
-        type_: get_cell_content!("td.termType"),
+        r#type: get_cell_content!("td.termType"),
         lawsuit: get_cell_content!("td.termLawsuit"),
         hall: get_cell_content!("td.termHall"),
         reference: get_cell_content!("td.termReference"),
@@ -124,10 +124,11 @@ async fn parse_table(url: &str, date: NaiveDate) -> Result<Vec<Session>, Error> 
             return Err(Error::ParseError(error.clone()));
         }
 
-        let entries = document
+        let entries: Vec<_> = document
             .select(&SELECTOR)
             .map(|tr| parse_row(tr, date))
             .collect();
+        log::debug!("Got {} entries", entries.len());
         Ok(entries)
     })
     .await
@@ -145,6 +146,7 @@ pub struct CourtInfo {
 pub async fn get_court_info(url_name: &str) -> Result<CourtInfo, Error> {
     let mut schedule = Vec::new();
     let (full_name, urls) = parse_index_page(url_name).await?;
+    log::debug!("Found urls: {:?}", urls);
     for (date, url) in urls {
         schedule.extend(parse_table(&url, date).await?)
     }
