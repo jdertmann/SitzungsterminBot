@@ -4,6 +4,7 @@ use chrono::NaiveDate;
 use regex::Regex;
 use teloxide::utils::markdown::{bold, code_inline, escape};
 
+use crate::database::Subscription;
 use crate::scraper::{CourtInfo, Schedule, Session};
 
 pub struct DateFilter {
@@ -153,11 +154,20 @@ pub fn subscribed(name: &str, court_info: &Option<CourtInfo>, reference: &str) -
     result
 }
 
-pub fn unsubscribed(n: usize) -> String {
-    if n == 0 {
-        escape("Es wurde kein Abo mit dem Namen gefunden.")
-    } else {
+pub fn list_subscriptions(list: &[Subscription]) -> String {
+    escape("Deine Abos:\n\n")
+        + &list
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+}
+
+pub fn unsubscribed(removed: bool) -> String {
+    if removed {
         escape("Abo wurde gelöscht 👍")
+    } else {
+        escape("Es wurde kein Abo mit dem Namen gefunden.")
     }
 }
 
@@ -189,5 +199,5 @@ pub fn handle_update(
 }
 
 pub fn internal_error() -> String {
-    escape(&format!("Sorry, ein interner Fehler ist aufgetreten :(("))
+    escape("Sorry, ein interner Fehler ist aufgetreten :((")
 }

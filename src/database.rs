@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::scraper::Session;
 
+#[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
 }
@@ -28,16 +29,14 @@ impl Database {
         chat_id: ChatId,
         court: &str,
         name: &str,
-        date_filter: &str,
         reference_filter: &str,
     ) -> Result<i64, Error> {
         query!(
-            "INSERT INTO subscriptions (chat_id, court, name, date_filter, reference_filter)
-            VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO subscriptions (chat_id, court, name, reference_filter)
+            VALUES (?, ?, ?, ?)",
             chat_id.0,
             court,
             name,
-            date_filter,
             reference_filter
         )
         .execute(&self.pool)
@@ -208,7 +207,6 @@ impl Database {
             .and_then(|x| async move { Session::from_row(&x) })
             .try_collect()
             .await
-        
     }
 
     pub async fn get_subscribed_courts(&self) -> Result<Vec<String>, Error> {
@@ -219,14 +217,24 @@ impl Database {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+#[allow(unused)]
 pub struct Subscription {
     pub subscription_id: i64,
     pub chat_id: i64,
     pub court: String,
     pub confirmation_sent: i64,
     pub name: String,
-    pub date_filter: String,
     pub reference_filter: String,
+}
+
+impl std::fmt::Display for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {}, {}",
+            self.name, self.court, self.reference_filter
+        )
+    }
 }
 
 #[derive(Debug, Clone)]

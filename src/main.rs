@@ -1,5 +1,6 @@
 mod chat_list;
 mod court;
+mod database;
 mod messages;
 mod scraper;
 
@@ -9,9 +10,11 @@ use std::time::Duration;
 use chat_list::ChatData;
 // use chat_list::ChatData;
 use court::Courts;
+use database::Database;
 use dptree::deps;
+use teloxide::filter_command;
 use teloxide::macros::BotCommands;
-use teloxide::{filter_command, prelude::*};
+use teloxide::prelude::*;
 use teloxide::types::{MessageId, ReplyParameters};
 use teloxide::utils::command::ParseError;
 use thiserror::Error;
@@ -75,7 +78,27 @@ impl MessageSender {
 #[error("Error while parsing arguments in posix-shell manner")]
 struct ShlexError;
 
-fn split(s: String) -> Result<(String, String, String), ParseError> {
+fn split1(s: String) -> Result<(String,), ParseError> {
+    let split = shlex::split(&s).ok_or(ParseError::IncorrectFormat(Box::new(ShlexError)))?;
+
+    match split.len() {
+        ..=0 => Err(ParseError::TooFewArguments {
+            expected: 3,
+            found: split.len(),
+            message: String::from("Please use quotes like in posix-shells"),
+        }),
+        1 => {
+            let [a] = split.try_into().unwrap();
+            Ok((a,))
+        }
+        2.. => Err(ParseError::TooManyArguments {
+            expected: 3,
+            found: split.len(),
+            message: String::from("Please use quotes like in posix-shells"),
+        }),
+    }
+}
+fn split3(s: String) -> Result<(String, String, String), ParseError> {
     let split = shlex::split(&s).ok_or(ParseError::IncorrectFormat(Box::new(ShlexError)))?;
 
     match split.len() {
@@ -105,17 +128,19 @@ fn split(s: String) -> Result<(String, String, String), ParseError> {
 enum Command {
     #[command(description = "zeige diesen Text an.")]
     Help,
-    #[command(description = "abonniere ein Verfahren.", parse_with = split)]
+    #[command(description = "abonniere ein Verfahren.", parse_with = split3)]
     Subscribe {
         name: String,
         court: String,
         reference: String,
     },
-    #[command(description = "entferne ein Abonnement.")]
+    #[command(description = "zeige deine Abos an.")]
+    ListSubscriptions,
+    #[command(description = "entferne ein Abo.", parse_with= split1)]
     Unsubscribe {
         name: String,
     },
-    #[command(description = "zeige Termine an.", parse_with = split)]
+    #[command(description = "zeige Termine an.", parse_with = split3)]
     GetSessions {
         court: String,
         date: String,
@@ -133,60 +158,109 @@ async fn main() {
 
     let bot = Bot::from_env();
     let notification_queue = MessageSender::new(bot.clone());
-    let courts = Arc::new(Mutex::new(Courts::new(notification_queue, std::env::var("DATABASE_URL").unwrap())));
-
+    let database_url = std::env::var("DATABASE_URL").unwrap();
+    let database = Database::new(&database_url).await.unwrap();
+    let courts = Arc::new(Mutex::new(
+        Courts::new(notification_queue, database.clone()).await,
+    ));
     //let chat_data : Arc<RwLock<HashMap<ChatId, ChatData>>> = Default::default();
 
-    let answer = |bot: Bot, msg: Message, cmd: Command, courts: Arc<Mutex<Courts>>| {
-        async move {
-            log::info!("{:?}", cmd);
-            let chat_id = msg.chat.id;
-            macro_rules! get_court {
-                ($court:expr) => {
-                    match courts.lock().await.get(&$court) {
-                        Ok(x) => x,
-                        Err(_) => {
-                            bot.send_message(msg.chat.id, "Ungültiger Gerichtsname!")
-                                .reply_parameters(ReplyParameters::new(msg.id))
-                                .await?;
-                            return Ok(());
+    let answer =
+        |bot: Bot, msg: Message, cmd: Command, courts: Arc<Mutex<Courts>>, database: Database| {
+            async move {
+                log::info!("{:?}", cmd);
+                let chat_id = msg.chat.id;
+                macro_rules! get_court {
+                    ($court:expr) => {
+                        match courts.lock().await.get(&$court) {
+                            Ok(x) => x,
+                            Err(_) => {
+                                bot.send_message(msg.chat.id, "Ungültiger Gerichtsname!")
+                                    .reply_parameters(ReplyParameters::new(msg.id))
+                                    .await?;
+                                return Ok(());
+                            }
                         }
+                    };
+                }
+                match cmd {
+                    Command::Help => {
+                        bot.send_message(msg.chat.id, HELP_MESSAGE)
+                            .reply_parameters(ReplyParameters::new(msg.id))
+                            .await?;
                     }
-                };
-            }
-            match cmd {
-                Command::Help => {
-                    bot.send_message(msg.chat.id, HELP_MESSAGE)
-                        .reply_parameters(ReplyParameters::new(msg.id))
-                        .await?;
-                }
-                Command::Subscribe {
-                    name,
-                    court,
-                    reference,
-                } => {
-                    // get_court!(court).confirm_subscription(msg, ChatData::new(chat_id), name, reference)
-                    todo!()
-                }
-                Command::Unsubscribe { name } => {
-                    todo!(); //get_court!(court).remove_subscription(msg.chat.id, Some(name), true);
-                }
-                Command::GetSessions {
-                    court,
-                    date,
-                    reference,
-                } => get_court!(court).get_sessions(msg, date, reference),
-                Command::ForceUpdate { court } => get_court!(court).update(true),
-            }
-            Ok::<(), teloxide::RequestError>(())
-        }
-    };
+                    Command::Subscribe {
+                        name,
+                        court,
+                        reference,
+                    } => {
+                        get_court!(court); // assert name valid
+                        let subscription_id = match database
+                            .add_subscription(msg.chat.id, &court, &name, &reference)
+                            .await
+                        {
+                            Ok(id) => id,
+                            Err(e) => {
+                                log::error!("Database error: {e}");
+                                bot.send_message(msg.chat.id, messages::internal_error())
+                                    .reply_parameters(ReplyParameters::new(msg.id))
+                                    .await?;
+                                return Ok(());
+                            }
+                        };
+                        get_court!(court).confirm_subscription(msg, subscription_id)
+                    }
+                    Command::ListSubscriptions => {
+                        let reply = match database.get_subscriptions_by_chat(msg.chat.id).await {
+                            Ok(subs) => messages::list_subscriptions(&subs),
+                            Err(e) => {
+                                log::error!("Database error: {e}");
+                                messages::internal_error()
+                            }
+                        };
 
-    Dispatcher::builder(bot, Update::filter_message().filter_command::<Command>().endpoint(answer))
-        .dependencies(deps![courts])
-        .default_handler(|_| async {})
-        .enable_ctrlc_handler()
-        .build().dispatch().await
+                        bot.send_message(msg.chat.id, reply)
+                            .reply_parameters(ReplyParameters::new(msg.id))
+                            .await?;
+                        return Ok(());
+                    }
+                    Command::Unsubscribe { name } => {
+                        let reply = match database.remove_subscription(msg.chat.id, &name).await {
+                            Ok(removed) => messages::unsubscribed(removed),
+                            Err(e) => {
+                                log::error!("Database error: {e}");
+                                messages::internal_error()
+                            }
+                        };
+
+                        bot.send_message(msg.chat.id, reply)
+                            .reply_parameters(ReplyParameters::new(msg.id))
+                            .await?;
+                        return Ok(());
+                    }
+                    Command::GetSessions {
+                        court,
+                        date,
+                        reference,
+                    } => get_court!(court).get_sessions(msg, date, reference),
+                    Command::ForceUpdate { court } => get_court!(court).update(true),
+                }
+                Ok::<(), teloxide::RequestError>(())
+            }
+        };
+
+    Dispatcher::builder(
+        bot,
+        Update::filter_message()
+            .filter_command::<Command>()
+            .endpoint(answer),
+    )
+    .dependencies(deps![courts, database])
+    .default_handler(|_| async {})
+    .enable_ctrlc_handler()
+    .build()
+    .dispatch()
+    .await
 }
 
 const HELP_MESSAGE : &str = "

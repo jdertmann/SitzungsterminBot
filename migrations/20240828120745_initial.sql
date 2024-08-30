@@ -21,7 +21,6 @@ CREATE TABLE subscriptions (
     court TEXT NOT NULL,
     name TEXT NOT NULL,
     confirmation_sent INTEGER DEFAULT 0 NOT NULL,
-    date_filter TEXT NOT NULL,
     reference_filter TEXT NOT NULL,
     UNIQUE (chat_id, name)
 );

@@ -1,11 +1,8 @@
-mod database_sql;
-
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
 use chrono::prelude::*;
-use database_sql::CourtMeta;
 use lazy_static::lazy_static;
 use regex::Regex;
 use teloxide::types::ChatId;
@@ -14,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
-use self::database_sql::{Database, Error as DbError};
+use crate::database::{CourtMeta, Database, Error as DbError};
 use crate::messages::DateFilter;
 use crate::scraper::CourtInfo;
 use crate::{messages, scraper, MessageSender};
@@ -55,7 +52,7 @@ impl CourtWorker {
         log::debug!("{}: Check for update", self.name);
 
         let maybe_meta = self.database.get_court_meta(&self.name).await?;
-        if let Some(meta) = dbg!(&maybe_meta) {
+        if let Some(meta) = &maybe_meta {
             if !force_update && !is_out_of_date(meta.last_update) {
                 log::debug!("{}: Already up to date", self.name);
                 return Ok(maybe_meta.unwrap());
@@ -138,8 +135,10 @@ impl CourtWorker {
 
     async fn database_error(&self, e: DbError, msg: &teloxide::types::Message) {
         log::error!("Database error: {e}");
-        let _ = self.notify
-            .send_direct(msg.chat.id, messages::internal_error(), Some(msg.id)).await;
+        let _ = self
+            .notify
+            .send_direct(msg.chat.id, messages::internal_error(), Some(msg.id))
+            .await;
     }
 
     async fn handle_get_sessions(
@@ -213,6 +212,7 @@ impl CourtWorker {
     }
 
     async fn run(mut self) {
+        log::info!("Starting worker task for {}", self.name);
         loop {
             tokio::select! {
                 _ = self.auto_update.tick() => self.handle_update(false).await,
@@ -276,12 +276,12 @@ impl Drop for Court {
 pub struct Courts {
     courts: HashMap<String, Court>,
     notification_queue: MessageSender,
-    database_url: String
+    database: Database,
 }
 
 pub struct CourtRef<'a> {
     courts: &'a mut Courts,
-    name: &'a str
+    name: &'a str,
 }
 
 #[derive(Debug, Error)]
@@ -293,12 +293,32 @@ lazy_static! {
 }
 
 impl Courts {
-    pub fn new(notification_queue: MessageSender, database_url: String) -> Self {
-        Self {
+    pub async fn new(notification_queue: MessageSender, database: Database) -> Self {
+        let mut this = Self {
             notification_queue,
             courts: Default::default(),
-            database_url
-        }
+            database,
+        };
+
+        this.init_subscribed().await;
+
+        this
+    }
+
+    pub async fn init_subscribed(&mut self) {
+        match self.database.get_subscribed_courts().await {
+            Ok(names) => {
+                for name in names {
+                    match self.get(&name) {
+                        Ok(mut c) => c.init(),
+                        Err(_) => log::warn!("Invalid court name in db: {name}"),
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Database error, can't init court workers: {e}")
+            }
+        };
     }
 
     pub fn get<'a>(&'a mut self, court_name: &'a str) -> Result<CourtRef<'a>, InvalidCourtName> {
@@ -307,7 +327,7 @@ impl Courts {
         }
         Ok(CourtRef {
             courts: self,
-            name: court_name
+            name: court_name,
         })
     }
 }
@@ -327,24 +347,27 @@ impl<'a> CourtRef<'a> {
 
         let name = self.name.to_string();
         let notify = self.courts.notification_queue.clone();
-        let database_url = self.courts.database_url.clone();
+        let database = self.courts.database.clone();
+        let worker = CourtWorker {
+            name,
+            message_rx,
+            notify,
+            auto_update,
+            database,
+        };
 
-        tokio::spawn(async move {
-            let database =
-                database_sql::Database::new(&database_url).await?;
-            let worker = CourtWorker {
-                name,
-                message_rx,
-                notify,
-                auto_update,
-                database,
-            };
-            Ok::<_, DbError>(worker.run().await)
-        });
+        tokio::spawn(worker.run());
 
         Court { message_tx }
     }
 
+    fn init(&mut self) {
+        if !self.courts.courts.contains_key(self.name) {
+            self.courts
+                .courts
+                .insert(self.name.to_owned(), self.create());
+        }
+    }
 
     fn send_msg(&mut self, mut msg: Message) {
         if let Some(court) = self.courts.courts.get(self.name) {
@@ -359,7 +382,6 @@ impl<'a> CourtRef<'a> {
                 }
             }
         }
-        
 
         let court = self.create();
         match court.message_tx.send(msg) {
@@ -370,16 +392,31 @@ impl<'a> CourtRef<'a> {
         self.courts.courts.insert(self.name.to_string(), court);
     }
 
-    pub fn get_sessions(&mut self, message: teloxide::types::Message, date: String, reference: String ) {
-        self.send_msg(Message::GetSessions { message, date, reference })
+    pub fn get_sessions(
+        &mut self,
+        message: teloxide::types::Message,
+        date: String,
+        reference: String,
+    ) {
+        self.send_msg(Message::GetSessions {
+            message,
+            date,
+            reference,
+        })
     }
-    
-    pub fn confirm_subscription(&mut self, message: teloxide::types::Message, subscription_id: i64 ) {
-        self.send_msg(Message::ConfirmSubscription { message, subscription_id })
+
+    pub fn confirm_subscription(
+        &mut self,
+        message: teloxide::types::Message,
+        subscription_id: i64,
+    ) {
+        self.send_msg(Message::ConfirmSubscription {
+            message,
+            subscription_id,
+        })
     }
-    
-    pub fn update(&mut self, force: bool ) {
+
+    pub fn update(&mut self, force: bool) {
         self.send_msg(Message::Update { force })
     }
 }
-
