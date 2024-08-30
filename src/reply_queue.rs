@@ -4,15 +4,16 @@ use teloxide::prelude::*;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::messages::MarkdownString;
 use crate::Bot;
 
 #[derive(Clone)]
-pub struct ReplyQueue(mpsc::UnboundedSender<(ChatId, String)>);
+pub struct ReplyQueue(mpsc::UnboundedSender<(ChatId, MarkdownString)>);
 
 impl ReplyQueue {
-    async fn send(bot: &Bot, chat_id: ChatId, msg: String) {
+    async fn send(bot: &Bot, chat_id: ChatId, msg: MarkdownString) {
         let result = bot
-            .send_message(chat_id, msg)
+            .send_message(chat_id, msg.to_string())
             .parse_mode(teloxide::types::ParseMode::MarkdownV2)
             .await;
 
@@ -22,7 +23,7 @@ impl ReplyQueue {
     }
 
     pub fn new(bot: Bot) -> (Self, JoinHandle<()>) {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(ChatId, String)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(ChatId, MarkdownString)>();
 
         let handle = tokio::task::spawn(async move {
             let mut buffer = Vec::with_capacity(20);
@@ -31,7 +32,7 @@ impl ReplyQueue {
 
             while rx.recv_many(&mut buffer, 20).await > 0 {
                 for (c, s) in buffer.iter() {
-                    Self::send(&bot, *c, s.to_string()).await;
+                    Self::send(&bot, *c, s.clone()).await;
                 }
                 buffer.clear();
                 interval.tick().await;
@@ -43,7 +44,7 @@ impl ReplyQueue {
         (Self(tx), handle)
     }
 
-    pub fn queue(&self, chat_id: ChatId, msg: String) {
+    pub fn queue(&self, chat_id: ChatId, msg: MarkdownString) {
         if self.0.send((chat_id, msg)).is_err() {
             log::error!("Queuing message failed!")
         }

@@ -1,8 +1,10 @@
+mod markdown_string;
+
 use std::collections::HashSet;
 
 use regex::Regex;
-use teloxide::utils::markdown::{bold, code_inline, escape};
 
+pub use self::markdown_string::MarkdownString;
 use crate::database::Subscription;
 use crate::scraper::{CourtData, Session};
 
@@ -22,7 +24,7 @@ impl ReferenceFilter {
     }
 }
 
-pub fn session_info(entry: &Session) -> String {
+pub fn session_info(entry: &Session) -> MarkdownString {
     let datetime = format!("{}, {}", entry.date.format("%A, %-d. %B %C%y"), entry.time);
 
     let byline = if entry.lawsuit.is_empty() {
@@ -31,27 +33,28 @@ pub fn session_info(entry: &Session) -> String {
         format!("{}, {}", entry.lawsuit, entry.r#type)
     };
 
-    let mut result = format!(
-        "{}\nSitzungssaal {}\n{}\nAktenzeichen: {}",
-        bold(&escape(&datetime)),
-        escape(if entry.hall.is_empty() {
-            "unbekannt"
-        } else {
-            &entry.hall
-        }),
-        escape(&byline),
-        code_inline(&entry.reference)
-    );
+    let hall = if entry.hall.is_empty() {
+        "unbekannt"
+    } else {
+        entry.hall.as_str()
+    };
+
+    let mut result = MarkdownString::from_str(&datetime).bold();
+    result += format!("\nSitzungssaal {}\n{}\nAktenzeichen: ", hall, byline).as_str();
+    result += &MarkdownString::code_inline(&entry.reference);
 
     if !entry.note.is_empty() {
-        result += &format!("\nHinweis: {}", escape(&entry.note));
+        result += format!("\nHinweis: {}", entry.note).as_str();
     }
 
     result
 }
 
-pub fn create_list(sessions: &[Session], filter: impl Fn(&Session) -> bool) -> (u64, String) {
-    let mut result = String::new();
+pub fn create_list(
+    sessions: &[Session],
+    filter: impl Fn(&Session) -> bool,
+) -> (u64, MarkdownString) {
+    let mut result = MarkdownString::new();
     let mut count = 0;
     for session in sessions {
         if !filter(session) {
@@ -67,13 +70,13 @@ pub fn create_list(sessions: &[Session], filter: impl Fn(&Session) -> bool) -> (
     (count, result)
 }
 
-pub fn invalid_date() -> String {
-    escape("Das angegebene Datum ist ungültig.")
+pub fn invalid_date() -> MarkdownString {
+    "Das angegebene Datum ist ungültig.".into()
 }
 
-pub fn list_sessions(court_data: &Option<CourtData>, reference: &str) -> String {
+pub fn list_sessions(court_data: &Option<CourtData>, reference: &str) -> MarkdownString {
     let Some(court_data) = court_data else {
-        return escape("Leider sind keine Informationen für dieses Gericht verfügbar.");
+        return "Leider sind keine Informationen für dieses Gericht verfügbar.".into();
     };
 
     let reference = ReferenceFilter::new(reference);
@@ -82,27 +85,36 @@ pub fn list_sessions(court_data: &Option<CourtData>, reference: &str) -> String 
         reference.matches(&session.reference)
     });
 
+    let full_name = MarkdownString::from_str(&court_data.full_name).bold();
+    let mut result = MarkdownString::new();
+
     match count {
-        0 => format!(
-            "Leider wurden keine Termine für das {}, die zu deinem Filter passen, gefunden\\.",
-            bold(&escape(&court_data.full_name))
-        ),
-        1 => format!(
-            "Es wurde 1 Termin für das {} gefunden:{}",
-            bold(&escape(&court_data.full_name)),
-            list
-        ),
-        _ => format!(
-            "Es wurden {} Termine für das {} gefunden:{}",
-            escape(&count.to_string()),
-            bold(&escape(&court_data.full_name)),
-            list
-        ),
+        0 => {
+            result += "Leider wurden keine Termine für das ";
+            result += &full_name;
+            result += ", die zu deinem Filter passen, gefunden.";
+        }
+        1 => {
+            result += "Es wurde 1 Termin für das ";
+            result += &full_name;
+            result += " gefunden:";
+            result += &list;
+        }
+        _ => {
+            result += &format!("Es wurden {count} Termine für das ");
+            result += &full_name;
+            result += " gefunden:";
+            result += &list;
+        }
     }
+
+    result
 }
 
-pub fn subscribed(name: &str, court_data: &Option<CourtData>, reference: &str) -> String {
-    let mut result = escape(&format!("Dein Abo „{name}” wurde entgegengenommen."));
+pub fn subscribed(name: &str, court_data: &Option<CourtData>, reference: &str) -> MarkdownString {
+    let mut result = format!("Dein Abo „{name}” wurde entgegengenommen. ")
+        .as_str()
+        .into();
     match court_data {
         Some(data) => {
             let reference = ReferenceFilter::new(reference);
@@ -112,56 +124,58 @@ pub fn subscribed(name: &str, court_data: &Option<CourtData>, reference: &str) -
 
             match count {
                 0 => {
-                    result += &escape(
-                        " Zur Zeit gibt es nichts zu melden, aber ich halt dich auf dem Laufenden!",
-                    )
+                    result +=
+                        "Zur Zeit gibt es nichts zu melden, aber ich halt dich auf dem Laufenden!";
                 }
                 _ => {
-                    result += &escape(" Hier schon mal eine Liste der anstehenden Termine:");
+                    result += "Hier schon mal eine Liste der anstehenden Termine:";
                     result += &list;
-                    result += &escape("\n\nBei neuen Terminen werde ich dich benachrichtigen!");
+                    result += "\n\nBei neuen Terminen werde ich dich benachrichtigen!";
                 }
             }
         }
         None => {
-            result += &escape(" Ich kann die Website des Gerichts leider nicht erreichen, aber ich halt dich auf dem Laufenden.");
+            result += "Ich kann die Website des Gerichts leider nicht erreichen, aber ich halt dich auf dem Laufenden.";
         }
     }
 
     result
 }
 
-pub fn subscription_exists(name: &str) -> String {
-    escape(&format!(
-        "Ein Abo mit dem Namen „{name}” existiert bereits!"
-    ))
+pub fn subscription_exists(name: &str) -> MarkdownString {
+    format!("Ein Abo mit dem Namen „{name}” existiert bereits!")
+        .as_str()
+        .into()
 }
 
-pub fn list_subscriptions(list: &[Subscription]) -> String {
-    if list.is_empty() {
-        escape("Du hast zur Zeit keine Abos am laufen!")
+fn subscription_entry(s: &Subscription) -> MarkdownString {
+    MarkdownString::from_str(&s.name).bold()
+        + &format!(
+            "\nGericht: {}\nAktenzeichen: {}",
+            s.court, s.reference_filter
+        )
+}
+
+pub fn list_subscriptions(subscriptions: &[Subscription]) -> MarkdownString {
+    if subscriptions.is_empty() {
+        "Du hast zur Zeit keine Abos am laufen!".into()
     } else {
-        escape("Hier ist eine Liste deiner Abos:\n\n")
-            + &list
-                .iter()
-                .map(|s| {
-                    bold(&escape(&s.name))
-                        + &escape(&format!(
-                            "\nGericht: {}\nAktenzeichen: {}",
-                            s.court, s.reference_filter
-                        ))
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
+        let mut result = "Hier ist eine Liste deiner Abos:".into();
+        for sub in subscriptions {
+            result += "\n\n";
+            result += &subscription_entry(sub);
+        }
+        result
     }
 }
 
-pub fn unsubscribed(removed: bool) -> String {
+pub fn unsubscribed(removed: bool) -> MarkdownString {
     if removed {
-        escape("Abo wurde gelöscht 👍")
+        "Abo wurde gelöscht 👍"
     } else {
-        escape("Es wurde kein Abo mit diesem Namen gefunden.")
+        "Es wurde kein Abo mit diesem Namen gefunden."
     }
+    .into()
 }
 
 pub fn sessions_updated(
@@ -170,7 +184,7 @@ pub fn sessions_updated(
     full_court_name: &str,
     subscription_name: &str,
     reference_filter: &str,
-) -> Option<String> {
+) -> Option<MarkdownString> {
     let reference = ReferenceFilter::new(reference_filter);
 
     let old_sessions: HashSet<_> = old_sessions.iter().collect();
@@ -183,17 +197,16 @@ pub fn sessions_updated(
         return None;
     }
 
-    let msg = escape("🔔 Für dein Abo „")
-        + &bold(&escape(subscription_name))
-        + &escape(&format!(
-            "” ({full_court_name}) wurden neue Termine veröffentlicht!"
-        ))
-        + &list;
+    let mut result = MarkdownString::new();
+    result += "🔔 Für dein Abo „";
+    result += &MarkdownString::from_str(subscription_name).bold();
+    result += &format!("” ({full_court_name}) wurden neue Termine veröffentlicht!");
+    result += &list;
 
-    Some(msg)
+    Some(result)
 }
 
-pub fn help() -> String {
+pub fn help() -> MarkdownString {
     let help = "
 Unterstützte Befehle:
 /help
@@ -212,9 +225,9 @@ Im Aktenzeichen steht \"?\" für ein beliebiges einzelnes Zeichen,  \"*\" für e
 
 Keine Gewähr für verpasste Termine!";
 
-    escape(help)
+    help.into()
 }
 
-pub fn internal_error() -> String {
-    escape("Sorry, ein interner Fehler ist aufgetreten :((")
+pub fn internal_error() -> MarkdownString {
+    "Sorry, ein interner Fehler ist aufgetreten :((".into()
 }

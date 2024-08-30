@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 
 use super::Message;
 use crate::database::{CourtMeta, Database, Error as DbError};
+use crate::messages::MarkdownString;
 use crate::reply_queue::ReplyQueue;
 use crate::scraper::CourtData;
 use crate::{messages, scraper};
@@ -143,7 +144,7 @@ impl CourtWorker {
         }
     }
 
-    async fn handle_get_sessions(&mut self, date: String, reference: String) -> String {
+    async fn handle_get_sessions(&mut self, date: String, reference: String) -> MarkdownString {
         let date = if &date == "*" {
             None
         } else if let Ok(date) = NaiveDate::parse_from_str(&date, "%d.%m.%Y") {
@@ -158,7 +159,10 @@ impl CourtWorker {
         messages::list_sessions(&data, &reference)
     }
 
-    async fn handle_confirm_subscription(&mut self, subscription_id: i64) -> Option<String> {
+    async fn handle_confirm_subscription(
+        &mut self,
+        subscription_id: i64,
+    ) -> Option<MarkdownString> {
         let sub = handle_db_error!(self.database.get_subscription_by_id(subscription_id).await);
 
         let Some(sub) = sub else {

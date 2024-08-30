@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use crate::database::Database;
+use crate::messages::MarkdownString;
 use crate::reply_queue::ReplyQueue;
 
 enum Message {
@@ -43,14 +44,14 @@ impl Drop for Court {
 }
 
 pub trait ReplyFn: Send + 'static {
-    fn reply(self: Box<Self>, msg: String) -> BoxFuture<'static, ()>;
+    fn reply(self: Box<Self>, msg: MarkdownString) -> BoxFuture<'static, ()>;
 }
 
 impl<T, F: Future<Output = ()> + Send + 'static> ReplyFn for T
 where
-    T: (FnOnce(String) -> F) + Send + 'static,
+    T: (FnOnce(MarkdownString) -> F) + Send + 'static,
 {
-    fn reply(self: Box<Self>, msg: String) -> BoxFuture<'static, ()> {
+    fn reply(self: Box<Self>, msg: MarkdownString) -> BoxFuture<'static, ()> {
         Box::pin(self(msg)) as BoxFuture<'static, ()>
     }
 }

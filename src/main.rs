@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use courts::Courts;
 use dptree::deps;
-use messages::help;
 use teloxide::adaptors::DefaultParseMode;
 use teloxide::macros::BotCommands;
 use teloxide::prelude::*;
@@ -18,6 +17,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::database::Database;
+use crate::messages::{help, MarkdownString};
 
 #[derive(Error, Debug)]
 #[error("Error while parsing arguments in posix-shell manner")]
@@ -109,9 +109,9 @@ async fn answer(
 
     let reply_fn = || {
         let bot = bot.clone();
-        move |reply: String| async move {
+        move |reply: MarkdownString| async move {
             let r = bot
-                .send_message(msg.chat.id, reply)
+                .send_message(msg.chat.id, reply.to_string())
                 .reply_parameters(ReplyParameters::new(msg.id))
                 .send()
                 .await;
@@ -124,7 +124,7 @@ async fn answer(
 
     macro_rules! reply_and_return {
         ($reply:expr) => {{
-            bot.send_message(msg.chat.id, $reply)
+            bot.send_message(msg.chat.id, $reply.to_string())
                 .reply_parameters(ReplyParameters::new(msg.id))
                 .send()
                 .await?;
