@@ -77,7 +77,7 @@ pub fn create_list(schedule: &Schedule, filter: impl Fn(&Session) -> bool) -> (u
         count += 1;
 
         result += "\n\n";
-        result += &session_info(&session)
+        result += &session_info(session)
     }
 
     (count, result)
@@ -148,7 +148,9 @@ pub fn subscribed(name: &str, court_info: &Option<CourtInfo>, reference: &str) -
 }
 
 pub fn subscription_exists(name: &str) -> String {
-    escape(&format!("Ein Abo mit dem Namen „{name}” existiert bereits!"))
+    escape(&format!(
+        "Ein Abo mit dem Namen „{name}” existiert bereits!"
+    ))
 }
 
 pub fn list_subscriptions(list: &[Subscription]) -> String {
@@ -177,7 +179,7 @@ pub fn handle_update(
 ) -> Option<String> {
     let reference = ReferenceFilter::new(reference_filter);
 
-    let old_sessions: HashSet<_> = old_schedule.into_iter().collect();
+    let old_sessions: HashSet<_> = old_schedule.iter().collect();
 
     let (count, list) = create_list(new_schedule, |session| {
         reference.matches(&session.reference) && !old_sessions.contains(&session)

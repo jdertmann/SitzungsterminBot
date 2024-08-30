@@ -1,9 +1,8 @@
 use std::borrow::Cow;
-use std::sync::LazyLock;
 
 use chrono::prelude::*;
 use chrono_tz::Europe;
-use reqwest;
+use lazy_static::lazy_static;
 use scraper::selectable::Selectable;
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -41,12 +40,14 @@ fn get_inner_text(e: &ElementRef) -> String {
     text
 }
 
-async fn parse_index_page(url_name: &str) -> Result<(String, Vec<(NaiveDate, String)>), Error> {
-    const NAME_SELECTOR: LazyLock<Selector> =
-        LazyLock::new(|| Selector::parse("meta[name=Copyright]").unwrap());
-    const DATES_SELECTOR: LazyLock<Selector> =
-        LazyLock::new(|| Selector::parse("#startDate > option").unwrap());
+lazy_static! {
+    static ref TR_SELECTOR: Selector =
+        Selector::parse("table#sitzungsTermineTable tr[id].dataRow").unwrap();
+    static ref NAME_SELECTOR: Selector = Selector::parse("meta[name=Copyright]").unwrap();
+    static ref DATES_SELECTOR: Selector = Selector::parse("#startDate > option").unwrap();
+}
 
+async fn parse_index_page(url_name: &str) -> Result<(String, Vec<(NaiveDate, String)>), Error> {
     let url = get_url(url_name);
     log::info!("Get site {url}");
     let result = reqwest::get(url).await?;
@@ -69,7 +70,7 @@ async fn parse_index_page(url_name: &str) -> Result<(String, Vec<(NaiveDate, Str
             .to_string();
 
         let urls = document.select(&DATES_SELECTOR).filter_map(|elem| {
-            let Some(date_unix) = elem.value().attr("value") else { return None };
+            let date_unix = elem.value().attr("value")?;
             let date_unix : i64 = match date_unix.trim().parse() {
                 Ok(timestamp) => timestamp,
                 Err(_) => {
@@ -90,7 +91,9 @@ async fn parse_index_page(url_name: &str) -> Result<(String, Vec<(NaiveDate, Str
 fn parse_row(tr: ElementRef, date: NaiveDate) -> Session {
     macro_rules! get_cell_content {
         ($sel:literal) => {{
-            const SELECTOR: LazyLock<Selector> = LazyLock::new(|| Selector::parse($sel).unwrap());
+            lazy_static! {
+                static ref SELECTOR: Selector = Selector::parse($sel).unwrap();
+            }
 
             match tr.select(&SELECTOR).next() {
                 Some(td) => get_inner_text(&td),
@@ -111,8 +114,6 @@ fn parse_row(tr: ElementRef, date: NaiveDate) -> Session {
 }
 
 async fn parse_table(url: &str, date: NaiveDate) -> Result<Vec<Session>, Error> {
-    const SELECTOR: LazyLock<Selector> =
-        LazyLock::new(|| Selector::parse("table#sitzungsTermineTable tr[id].dataRow").unwrap());
     log::info!("Get site {url}");
     let result = reqwest::get(url).await?;
     let html = result.text().await?;
@@ -125,7 +126,7 @@ async fn parse_table(url: &str, date: NaiveDate) -> Result<Vec<Session>, Error> 
         }
 
         let entries: Vec<_> = document
-            .select(&SELECTOR)
+            .select(&TR_SELECTOR)
             .map(|tr| parse_row(tr, date))
             .collect();
         log::debug!("Got {} entries", entries.len());

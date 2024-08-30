@@ -36,7 +36,7 @@ fn is_out_of_date(last_update: DateTime<Utc>) -> bool {
         .expect("Weird DST issues")
         .to_utc();
 
-    return last_update < treshold;
+    last_update < treshold
 }
 
 struct CourtWorker {
@@ -207,7 +207,6 @@ impl CourtWorker {
             .await
         {
             self.database_error(e, &message).await;
-            return;
         }
     }
 
