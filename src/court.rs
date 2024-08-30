@@ -93,7 +93,7 @@ impl CourtWorker {
 
         let schedule = new_info.as_ref().ok().map(|x| &x.schedule[..]);
         let full_name = new_info.as_ref().ok().map(|x| &x.full_name[..]);
-        dbg!(full_name);
+
         self.database
             .update_court_info(&self.name, &last_update, full_name, schedule)
             .await?;

@@ -20,13 +20,6 @@ impl DateFilter {
         let date = NaiveDate::parse_from_str(s, "%d.%m.%Y").ok()?;
         Some(DateFilter { date: Some(date) })
     }
-
-    fn matches(&self, date: NaiveDate) -> bool {
-        match &self.date {
-            Some(match_date) => date == *match_date,
-            None => true,
-        }
-    }
 }
 
 struct ReferenceFilter {
@@ -155,7 +148,7 @@ pub fn subscribed(name: &str, court_info: &Option<CourtInfo>, reference: &str) -
 }
 
 pub fn subscription_exists(name: &str) -> String {
-    escape("Ein Abo mit diesem Namen existiert bereits!")
+    escape(&format!("Ein Abo mit dem Namen „{name}” existiert bereits!"))
 }
 
 pub fn list_subscriptions(list: &[Subscription]) -> String {

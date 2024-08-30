@@ -1,4 +1,3 @@
-mod chat_list;
 mod court;
 mod database;
 mod messages;
@@ -7,12 +6,9 @@ mod scraper;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chat_list::ChatData;
-// use chat_list::ChatData;
 use court::Courts;
 use database::Database;
 use dptree::deps;
-use teloxide::filter_command;
 use teloxide::macros::BotCommands;
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ReplyParameters};
@@ -169,7 +165,6 @@ async fn main() {
         |bot: Bot, msg: Message, cmd: Command, courts: Arc<Mutex<Courts>>, database: Database| {
             async move {
                 log::info!("{:?}", cmd);
-                let chat_id = msg.chat.id;
                 macro_rules! get_court {
                     ($court:expr) => {
                         match courts.lock().await.get(&$court) {
@@ -275,6 +270,8 @@ Unterstützte Befehle:
 /help
 /get_sessions <Gericht> <Datum> <Aktenzeichen>
 /subscribe <beliebiger Name> <Gericht> <Aktenzeichen>
+/list_subscriptions
+/unsubscribe <Name>
 
 Wenn ein Parameter Leerzeichen enthält, muss er in Anführungszeichen gesetzt werden.
 
