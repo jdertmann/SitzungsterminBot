@@ -193,6 +193,28 @@ pub fn sessions_updated(
     Some(msg)
 }
 
+pub fn help() -> String {
+    let help = "
+Unterstützte Befehle:
+/help
+/get_sessions <Gericht> <Datum> <Aktenzeichen>
+/subscribe <beliebiger Name> <Gericht> <Aktenzeichen>
+/list_subscriptions
+/unsubscribe <Name>
+
+Wenn ein Parameter Leerzeichen enthält, muss er in Anführungszeichen gesetzt werden.
+
+Der Name des Gerichts muss sein wie in der URL der Website, also z.B. \"vg-koeln\".
+
+Das Datum kann auch \"*\" sein, um jedes Datum zu erfassen.
+
+Im Aktenzeichen steht \"?\" für ein beliebiges einzelnes Zeichen,  \"*\" für eine beliebige Zeichenkette.
+
+Keine Gewähr für verpasste Termine!";
+
+    escape(help)
+}
+
 pub fn internal_error() -> String {
     escape("Sorry, ein interner Fehler ist aufgetreten :((")
 }

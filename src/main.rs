@@ -1,74 +1,24 @@
 mod court;
 mod database;
 mod messages;
+mod reply_queue;
 mod scraper;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use court::Courts;
-use database::Database;
 use dptree::deps;
+use messages::help;
+use reply_queue::ReplyQueue;
+use teloxide::adaptors::DefaultParseMode;
 use teloxide::macros::BotCommands;
 use teloxide::prelude::*;
-use teloxide::types::{MessageId, ReplyParameters};
+use teloxide::types::{ParseMode, ReplyParameters};
 use teloxide::utils::command::ParseError;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
-#[derive(Clone)]
-struct MessageSender {
-    queue: mpsc::UnboundedSender<(ChatId, String, Option<MessageId>)>,
-    direct: Bot,
-}
-
-impl MessageSender {
-    async fn send_inner(bot: &Bot, chat_id: ChatId, msg: String, reply_to: Option<MessageId>) {
-        let mut result = bot
-            .send_message(chat_id, msg)
-            .parse_mode(teloxide::types::ParseMode::MarkdownV2);
-
-        if let Some(reply_to) = reply_to {
-            result = result.reply_parameters(ReplyParameters::new(reply_to));
-        }
-
-        let result = result.await;
-
-        if let Err(e) = result {
-            log::warn!("Couldn't send message to {chat_id}: {e}")
-        }
-    }
-
-    fn new(bot: Bot) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(ChatId, String, Option<MessageId>)>();
-        let direct = bot.clone();
-        tokio::task::spawn(async move {
-            let mut buffer = Vec::with_capacity(20);
-
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-            loop {
-                rx.recv_many(&mut buffer, 20).await;
-                for (c, s, m) in buffer.iter() {
-                    Self::send_inner(&bot, *c, s.to_string(), *m).await;
-                }
-                buffer.clear();
-                interval.tick().await;
-            }
-        });
-
-        Self { queue: tx, direct }
-    }
-
-    fn send(&self, chat_id: ChatId, msg: String, reply_to: Option<MessageId>) {
-        let _ = self.queue.send((chat_id, msg, reply_to));
-    }
-
-    async fn send_direct(&self, chat_id: ChatId, msg: String, reply_to: Option<MessageId>) {
-        Self::send_inner(&self.direct, chat_id, msg, reply_to).await;
-    }
-}
+use crate::database::Database;
 
 #[derive(Error, Debug)]
 #[error("Error while parsing arguments in posix-shell manner")]
@@ -147,109 +97,124 @@ enum Command {
     },
 }
 
+type Bot = DefaultParseMode<teloxide::Bot>;
+
+async fn answer(
+    bot: Bot,
+    msg: Message,
+    cmd: Command,
+    courts: Arc<Mutex<Courts>>,
+    database: Database,
+) -> ResponseResult<()> {
+    log::info!("{:?}", cmd);
+
+    let reply_fn = || {
+        let bot = bot.clone();
+        move |reply: String| async move {
+            let r = bot
+                .send_message(msg.chat.id, reply)
+                .reply_parameters(ReplyParameters::new(msg.id))
+                .send()
+                .await;
+
+            if let Err(e) = r {
+                log::warn!("Couldn't send message: {e}");
+            }
+        }
+    };
+
+    macro_rules! reply_and_return {
+        ($reply:expr) => {{
+            bot.send_message(msg.chat.id, $reply)
+                .reply_parameters(ReplyParameters::new(msg.id))
+                .send()
+                .await?;
+
+            return Ok(());
+        }};
+    }
+
+    macro_rules! get_court {
+        ($court:expr) => {
+            match courts.lock().await.get(&$court) {
+                Ok(x) => x,
+                Err(_) => reply_and_return!("Ungültiger Gerichtsname!"),
+            }
+        };
+    }
+    match cmd {
+        Command::Help => {
+            reply_and_return!(help())
+        }
+        Command::Subscribe {
+            name,
+            court,
+            reference,
+        } => {
+            get_court!(court); // assert name is valid
+            let sub_id = database
+                .add_subscription(msg.chat.id, &court, &name, &reference)
+                .await;
+
+            let reply = match sub_id {
+                Ok(Some(subscription_id)) => {
+                    get_court!(court).confirm_subscription(subscription_id, reply_fn());
+                    return Ok(());
+                }
+                Ok(None) => messages::subscription_exists(&name),
+                Err(e) => {
+                    log::error!("Database error: {e}");
+                    messages::internal_error()
+                }
+            };
+
+            reply_and_return!(reply)
+        }
+        Command::ListSubscriptions => {
+            let reply = match database.get_subscriptions_by_chat(msg.chat.id).await {
+                Ok(subs) => messages::list_subscriptions(&subs),
+                Err(e) => {
+                    log::error!("Database error: {e}");
+                    messages::internal_error()
+                }
+            };
+
+            reply_and_return!(reply)
+        }
+        Command::Unsubscribe { name } => {
+            let reply = match database.remove_subscription(msg.chat.id, &name).await {
+                Ok(removed) => messages::unsubscribed(removed),
+                Err(e) => {
+                    log::error!("Database error: {e}");
+                    messages::internal_error()
+                }
+            };
+
+            reply_and_return!(reply)
+        }
+        Command::GetSessions {
+            court,
+            date,
+            reference,
+        } => {
+            get_court!(court).get_sessions(date, reference, reply_fn());
+        }
+        Command::ForceUpdate { court } => get_court!(court).update(true),
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
     log::info!("Starting bot...");
 
-    let bot = Bot::from_env();
-    let notification_queue = MessageSender::new(bot.clone());
+    let bot = teloxide::Bot::from_env().parse_mode(ParseMode::MarkdownV2);
+    let reply_queue = ReplyQueue::new(bot.clone());
     let database_url = std::env::var("DATABASE_URL").unwrap();
     let database = Database::new(&database_url).await.unwrap();
-    let courts = Arc::new(Mutex::new(
-        Courts::new(notification_queue, database.clone()).await,
-    ));
-    //let chat_data : Arc<RwLock<HashMap<ChatId, ChatData>>> = Default::default();
-
-    let answer =
-        |bot: Bot, msg: Message, cmd: Command, courts: Arc<Mutex<Courts>>, database: Database| {
-            async move {
-                log::info!("{:?}", cmd);
-                macro_rules! get_court {
-                    ($court:expr) => {
-                        match courts.lock().await.get(&$court) {
-                            Ok(x) => x,
-                            Err(_) => {
-                                bot.send_message(msg.chat.id, "Ungültiger Gerichtsname!")
-                                    .reply_parameters(ReplyParameters::new(msg.id))
-                                    .await?;
-                                return Ok(());
-                            }
-                        }
-                    };
-                }
-                match cmd {
-                    Command::Help => {
-                        bot.send_message(msg.chat.id, HELP_MESSAGE)
-                            .reply_parameters(ReplyParameters::new(msg.id))
-                            .await?;
-                    }
-                    Command::Subscribe {
-                        name,
-                        court,
-                        reference,
-                    } => {
-                        get_court!(court); // assert name is valid
-                        let reply = match database
-                            .add_subscription(msg.chat.id, &court, &name, &reference)
-                            .await
-                        {
-                            Ok(Some(subscription_id)) => {
-                                get_court!(court).confirm_subscription(msg, subscription_id);
-                                return Ok(());
-                            }
-                            Ok(None) => messages::subscription_exists(&name),
-                            Err(e) => {
-                                log::error!("Database error: {e}");
-                                messages::internal_error()
-                            }
-                        };
-                        bot.send_message(msg.chat.id, reply)
-                            .reply_parameters(ReplyParameters::new(msg.id))
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                            .await?;
-                        return Ok(());
-                    }
-                    Command::ListSubscriptions => {
-                        let reply = match database.get_subscriptions_by_chat(msg.chat.id).await {
-                            Ok(subs) => messages::list_subscriptions(&subs),
-                            Err(e) => {
-                                log::error!("Database error: {e}");
-                                messages::internal_error()
-                            }
-                        };
-
-                        bot.send_message(msg.chat.id, reply)
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                            .reply_parameters(ReplyParameters::new(msg.id))
-                            .await?;
-                        return Ok(());
-                    }
-                    Command::Unsubscribe { name } => {
-                        let reply = match database.remove_subscription(msg.chat.id, &name).await {
-                            Ok(removed) => messages::unsubscribed(removed),
-                            Err(e) => {
-                                log::error!("Database error: {e}");
-                                messages::internal_error()
-                            }
-                        };
-
-                        bot.send_message(msg.chat.id, reply)
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                            .reply_parameters(ReplyParameters::new(msg.id))
-                            .await?;
-                        return Ok(());
-                    }
-                    Command::GetSessions {
-                        court,
-                        date,
-                        reference,
-                    } => get_court!(court).get_sessions(msg, date, reference),
-                    Command::ForceUpdate { court } => get_court!(court).update(true),
-                }
-                Ok::<(), teloxide::RequestError>(())
-            }
-        };
+    let courts = Arc::new(Mutex::new(Courts::new(reply_queue, database.clone()).await));
 
     Dispatcher::builder(
         bot,
@@ -264,21 +229,3 @@ async fn main() {
     .dispatch()
     .await
 }
-
-const HELP_MESSAGE : &str = "
-Unterstützte Befehle:
-/help
-/get_sessions <Gericht> <Datum> <Aktenzeichen>
-/subscribe <beliebiger Name> <Gericht> <Aktenzeichen>
-/list_subscriptions
-/unsubscribe <Name>
-
-Wenn ein Parameter Leerzeichen enthält, muss er in Anführungszeichen gesetzt werden.
-
-Der Name des Gerichts muss sein wie in der URL der Website, also z.B. \"vg-koeln\".
-
-Das Datum kann auch \"*\" sein, um jedes Datum zu erfassen.
-
-Im Aktenzeichen steht \"?\" für ein beliebiges einzelnes Zeichen,  \"*\" für eine beliebige Zeichenkette.
-
-Keine Gewähr für verpasste Termine!";

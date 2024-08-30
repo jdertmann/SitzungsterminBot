@@ -1,19 +1,21 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
 use chrono::prelude::*;
+use futures_core::future::BoxFuture;
 use lazy_static::lazy_static;
 use regex::Regex;
 use teloxide::types::ChatId;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::SendError;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use crate::database::{CourtMeta, Database, Error as DbError};
+use crate::reply_queue::ReplyQueue;
 use crate::scraper::CourtData;
-use crate::{messages, scraper, MessageSender};
+use crate::{messages, scraper};
 
 pub const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(8, 0, 0);
 
@@ -42,20 +44,17 @@ struct CourtWorker {
     name: String,
     message_rx: mpsc::UnboundedReceiver<Message>,
     auto_update: tokio::time::Interval,
-    notify: MessageSender,
+    reply_queue: ReplyQueue,
     database: Database,
 }
+
 macro_rules! handle_db_error {
-    ($e:expr, $this:expr, $msg:expr) => {
+    ($e:expr) => {
         match $e {
             Ok(t) => t,
             Err(e) => {
                 log::error!("Database error: {e}");
-                let _ = $this
-                    .notify
-                    .send_direct($msg.chat.id, messages::internal_error(), Some($msg.id))
-                    .await;
-                return;
+                return messages::internal_error().into();
             }
         }
     };
@@ -80,7 +79,7 @@ impl CourtWorker {
                 continue;
             };
 
-            self.notify.send(ChatId(sub.chat_id), msg, None);
+            self.reply_queue.queue(ChatId(sub.chat_id), msg);
         }
 
         Ok(())
@@ -153,64 +152,39 @@ impl CourtWorker {
         }
     }
 
-    async fn handle_get_sessions(
-        &mut self,
-        message: teloxide::types::Message,
-        date: String,
-        reference: String,
-    ) {
+    async fn handle_get_sessions(&mut self, date: String, reference: String) -> String {
         let date = if &date == "*" {
             None
         } else if let Ok(date) = NaiveDate::parse_from_str(&date, "%d.%m.%Y") {
             Some(date)
         } else {
             // Invalid date in input
-            let _ = self
-                .notify
-                .send_direct(message.chat.id, messages::invalid_date(), Some(message.id))
-                .await;
-            return;
+            return messages::invalid_date();
         };
 
-        let data = handle_db_error!(self.get_court_data(date).await, self, message);
+        let data = handle_db_error!(self.get_court_data(date).await);
 
-        let msg = messages::list_sessions(&data, &reference);
-
-        self.notify
-            .send_direct(message.chat.id, msg, Some(message.id))
-            .await;
+        messages::list_sessions(&data, &reference)
     }
 
-    async fn handle_confirm_subscription(
-        &mut self,
-        message: teloxide::types::Message,
-        subscription_id: i64,
-    ) {
-        let sub = handle_db_error!(
-            self.database.get_subscription_by_id(subscription_id).await,
-            self,
-            message
-        );
+    async fn handle_confirm_subscription(&mut self, subscription_id: i64) -> Option<String> {
+        let sub = handle_db_error!(self.database.get_subscription_by_id(subscription_id).await);
 
         let Some(sub) = sub else {
             log::info!("Subscription {subscription_id} does not exist, already deleted?");
-            return;
+            return None;
         };
 
-        let data = handle_db_error!(self.get_court_data(None).await, self, message);
-        let msg = messages::subscribed(&sub.name, &data, &sub.reference_filter);
-
-        self.notify
-            .send_direct(message.chat.id, msg, Some(message.id))
-            .await;
+        let data = handle_db_error!(self.get_court_data(None).await);
+        let reply = messages::subscribed(&sub.name, &data, &sub.reference_filter);
 
         handle_db_error!(
             self.database
                 .set_subscription_confirmation_sent(subscription_id)
-                .await,
-            self,
-            message
+                .await
         );
+
+        Some(reply)
     }
 
     async fn run(mut self) {
@@ -226,18 +200,21 @@ impl CourtWorker {
                     match msg {
                         Message::Update { force } => self.handle_update(force).await,
                         Message::GetSessions {
-                            message,
                             date,
                             reference,
+                            reply_fn
                         } => {
-                            self.handle_get_sessions(message, date, reference)
-                                .await
+                            let reply = self.handle_get_sessions(date, reference).await;
+                            reply_fn.reply(reply).await;
                         }
                         Message::ConfirmSubscription {
-                            message,
-                            subscription_id
+                            subscription_id,
+                            reply_fn
                         } => {
-                            self.handle_confirm_subscription(message, subscription_id).await
+                            let reply = self.handle_confirm_subscription(subscription_id).await;
+                            if let Some(reply) = reply {
+                                reply_fn.reply(reply).await;
+                            }
                         }
                         Message::Close => {
                             self.message_rx.close();
@@ -249,18 +226,31 @@ impl CourtWorker {
     }
 }
 
+pub trait ReplyFn: Send + 'static {
+    fn reply(self: Box<Self>, msg: String) -> BoxFuture<'static, ()>;
+}
+
+impl<T, F: Future<Output = ()> + Send + 'static> ReplyFn for T
+where
+    T: (FnOnce(String) -> F) + Send + 'static,
+{
+    fn reply(self: Box<Self>, msg: String) -> BoxFuture<'static, ()> {
+        Box::pin(self(msg)) as BoxFuture<'static, ()>
+    }
+}
+
 enum Message {
     Update {
         force: bool,
     },
     GetSessions {
-        message: teloxide::types::Message,
         date: String,
         reference: String,
+        reply_fn: Box<dyn ReplyFn>,
     },
     ConfirmSubscription {
-        message: teloxide::types::Message,
         subscription_id: i64,
+        reply_fn: Box<dyn ReplyFn>,
     },
     Close,
 }
@@ -277,7 +267,7 @@ impl Drop for Court {
 
 pub struct Courts {
     courts: HashMap<String, Court>,
-    notification_queue: MessageSender,
+    reply_queue: ReplyQueue,
     database: Database,
 }
 
@@ -295,9 +285,9 @@ lazy_static! {
 }
 
 impl Courts {
-    pub async fn new(notification_queue: MessageSender, database: Database) -> Self {
+    pub async fn new(notification_queue: ReplyQueue, database: Database) -> Self {
         let mut this = Self {
-            notification_queue,
+            reply_queue: notification_queue,
             courts: Default::default(),
             database,
         };
@@ -348,12 +338,12 @@ impl<'a> CourtRef<'a> {
         auto_update.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let name = self.name.to_string();
-        let notify = self.courts.notification_queue.clone();
+        let notify = self.courts.reply_queue.clone();
         let database = self.courts.database.clone();
         let worker = CourtWorker {
             name,
             message_rx,
-            notify,
+            reply_queue: notify,
             auto_update,
             database,
         };
@@ -375,7 +365,7 @@ impl<'a> CourtRef<'a> {
         if let Some(court) = self.courts.courts.get(self.name) {
             match court.message_tx.send(msg) {
                 Ok(_) => return,
-                Err(SendError(msg_cp)) => {
+                Err(mpsc::error::SendError(msg_cp)) => {
                     log::warn!(
                         "cannot send message to court worker task {}, recreating ...",
                         self.name
@@ -394,27 +384,18 @@ impl<'a> CourtRef<'a> {
         self.courts.courts.insert(self.name.to_string(), court);
     }
 
-    pub fn get_sessions(
-        &mut self,
-        message: teloxide::types::Message,
-        date: String,
-        reference: String,
-    ) {
+    pub fn get_sessions(&mut self, date: String, reference: String, reply_fn: impl ReplyFn) {
         self.send_msg(Message::GetSessions {
-            message,
             date,
             reference,
+            reply_fn: Box::new(reply_fn),
         })
     }
 
-    pub fn confirm_subscription(
-        &mut self,
-        message: teloxide::types::Message,
-        subscription_id: i64,
-    ) {
+    pub fn confirm_subscription(&mut self, subscription_id: i64, reply_fn: impl ReplyFn) {
         self.send_msg(Message::ConfirmSubscription {
-            message,
             subscription_id,
+            reply_fn: Box::new(reply_fn),
         })
     }
 

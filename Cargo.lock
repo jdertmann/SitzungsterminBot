@@ -2223,7 +2223,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "env_logger",
- "futures",
+ "futures-core",
  "lazy_static",
  "log",
  "regex",
