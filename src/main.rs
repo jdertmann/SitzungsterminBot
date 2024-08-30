@@ -1,4 +1,4 @@
-mod court;
+mod courts;
 mod database;
 mod messages;
 mod reply_queue;
@@ -6,10 +6,9 @@ mod scraper;
 
 use std::sync::Arc;
 
-use court::Courts;
+use courts::Courts;
 use dptree::deps;
 use messages::help;
-use reply_queue::ReplyQueue;
 use teloxide::adaptors::DefaultParseMode;
 use teloxide::macros::BotCommands;
 use teloxide::prelude::*;
@@ -211,10 +210,9 @@ async fn main() {
     log::info!("Starting bot...");
 
     let bot = teloxide::Bot::from_env().parse_mode(ParseMode::MarkdownV2);
-    let reply_queue = ReplyQueue::new(bot.clone());
     let database_url = std::env::var("DATABASE_URL").unwrap();
     let database = Database::new(&database_url).await.unwrap();
-    let courts = Arc::new(Mutex::new(Courts::new(reply_queue, database.clone()).await));
+    let courts = Arc::new(Mutex::new(Courts::new(bot.clone(), database.clone()).await));
 
     Dispatcher::builder(
         bot,
@@ -222,10 +220,15 @@ async fn main() {
             .filter_command::<Command>()
             .endpoint(answer),
     )
-    .dependencies(deps![courts, database])
+    .dependencies(deps![courts.clone(), database])
     .default_handler(|_| async {})
     .enable_ctrlc_handler()
     .build()
     .dispatch()
-    .await
+    .await;
+
+    let Ok(courts) = Arc::try_unwrap(courts) else {
+        panic!("Weird Arc<Courts> flying around")
+    };
+    courts.into_inner().shutdown().await;
 }

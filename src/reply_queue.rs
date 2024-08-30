@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use teloxide::prelude::*;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::Bot;
 
@@ -20,10 +21,10 @@ impl ReplyQueue {
         }
     }
 
-    pub fn new(bot: Bot) -> Self {
+    pub fn new(bot: Bot) -> (Self, JoinHandle<()>) {
         let (tx, mut rx) = mpsc::unbounded_channel::<(ChatId, String)>();
 
-        tokio::task::spawn(async move {
+        let handle = tokio::task::spawn(async move {
             let mut buffer = Vec::with_capacity(20);
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -35,9 +36,11 @@ impl ReplyQueue {
                 buffer.clear();
                 interval.tick().await;
             }
+
+            log::info!("Reply queue task shut down.");
         });
 
-        Self(tx)
+        (Self(tx), handle)
     }
 
     pub fn queue(&self, chat_id: ChatId, msg: String) {
