@@ -1,10 +1,8 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use futures::stream::TryStreamExt;
 use sqlx::sqlite::SqlitePool;
 pub use sqlx::Error;
-use sqlx::{query, query_as, query_scalar, FromRow, QueryBuilder};
+use sqlx::{query, query_as, query_scalar, QueryBuilder};
 use teloxide::types::ChatId;
-use thiserror::Error;
 
 use crate::scraper::Session;
 
@@ -12,10 +10,6 @@ use crate::scraper::Session;
 pub struct Database {
     pool: SqlitePool,
 }
-
-#[derive(Error, Debug)]
-#[error("timestamp out of range")]
-pub struct TimestampOutOfRangeError;
 
 impl Database {
     pub async fn new(database_url: &str) -> Result<Self, Error> {
@@ -113,10 +107,9 @@ impl Database {
                 s.name,
                 s.reference_filter
             FROM subscriptions s LEFT JOIN courts c ON s.court = c.name
-            WHERE s.chat_id = ?"
-        ).bind(
-            chat_id.0
+            WHERE s.chat_id = ?",
         )
+        .bind(chat_id.0)
         .fetch_all(&self.pool)
         .await
     }
@@ -134,15 +127,13 @@ impl Database {
         .await
     }
 
-    pub async fn update_court_info(
+    pub async fn update_court_data(
         &self,
         court: &str,
-        last_update: &DateTime<Utc>,
-        full_name: Option<&str>,
-        schedule: Option<&[Session]>,
+        meta: &CourtMeta,
+        sessions: Option<&[Session]>,
     ) -> Result<(), Error> {
         let mut transaction = self.pool.begin().await?;
-        let timestamp = last_update.timestamp();
 
         query!(
             "INSERT INTO courts (name, full_name, last_update)
@@ -150,20 +141,20 @@ impl Database {
                 ON CONFLICT(name) 
                 DO UPDATE SET full_name = $2, last_update = $3",
             court,
-            full_name,
-            timestamp
+            meta.full_name,
+            meta.last_update
         )
         .execute(&mut *transaction)
         .await?;
 
-        if let Some(schedule) = schedule {
+        if let Some(sessions) = sessions {
             // Delete old sessions for the court
             query!("DELETE FROM sessions WHERE court = ?", court)
                 .execute(&mut *transaction)
                 .await?;
 
             // Insert new sessions
-            for session in schedule {
+            for session in sessions {
                 query!(
                     "INSERT INTO sessions (court, date, time, type, lawsuit, hall, reference, note)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -187,26 +178,10 @@ impl Database {
     }
 
     pub async fn get_court_meta(&self, court_name: &str) -> Result<Option<CourtMeta>, Error> {
-        let row = query!(
-            "SELECT full_name, last_update FROM courts WHERE name=?",
-            court_name
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| {
-            let last_update = DateTime::from_timestamp(row.last_update, 0).ok_or_else(|| {
-                Error::ColumnDecode {
-                    index: "last_update".to_string(),
-                    source: Box::new(TimestampOutOfRangeError),
-                }
-            })?;
-            Ok(CourtMeta {
-                full_name: row.full_name,
-                last_update,
-            })
-        })
-        .transpose()
+        query_as("SELECT full_name, last_update FROM courts WHERE name=?")
+            .bind(court_name)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     pub async fn get_sessions(
@@ -228,12 +203,7 @@ impl Database {
             query.push(" AND date = ").push_bind(date.to_string());
         }
 
-        query
-            .build()
-            .fetch(&self.pool)
-            .and_then(|x| async move { Session::from_row(&x) })
-            .try_collect()
-            .await
+        query.build_query_as().fetch_all(&self.pool).await
     }
 
     pub async fn get_subscribed_courts(&self) -> Result<Vec<String>, Error> {
@@ -254,7 +224,7 @@ pub struct Subscription {
     pub reference_filter: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CourtMeta {
     pub full_name: Option<String>,
     pub last_update: DateTime<Utc>,

@@ -12,8 +12,7 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use crate::database::{CourtMeta, Database, Error as DbError};
-use crate::messages::DateFilter;
-use crate::scraper::CourtInfo;
+use crate::scraper::CourtData;
 use crate::{messages, scraper, MessageSender};
 
 pub const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(8, 0, 0);
@@ -46,64 +45,106 @@ struct CourtWorker {
     notify: MessageSender,
     database: Database,
 }
+macro_rules! handle_db_error {
+    ($e:expr, $this:expr, $msg:expr) => {
+        match $e {
+            Ok(t) => t,
+            Err(e) => {
+                log::error!("Database error: {e}");
+                let _ = $this
+                    .notify
+                    .send_direct($msg.chat.id, messages::internal_error(), Some($msg.id))
+                    .await;
+                return;
+            }
+        }
+    };
+}
 
 impl CourtWorker {
-    async fn update(&mut self, force_update: bool) -> Result<CourtMeta, DbError> {
-        log::debug!("{}: Check for update", self.name);
+    async fn process_new_data(&mut self, new_data: &CourtData) -> Result<(), DbError> {
+        let old_sessions = self.database.get_sessions(&self.name, None, None).await?;
+        let subscriptions = self
+            .database
+            .get_confirmed_subscriptions_by_court(&self.name)
+            .await?;
 
-        let maybe_meta = self.database.get_court_meta(&self.name).await?;
-        if let Some(meta) = &maybe_meta {
+        for sub in subscriptions {
+            let Some(msg) = messages::sessions_updated(
+                &old_sessions,
+                &new_data.sessions,
+                &new_data.full_name,
+                &sub.name,
+                &sub.reference_filter,
+            ) else {
+                continue;
+            };
+
+            self.notify.send(ChatId(sub.chat_id), msg, None);
+        }
+
+        Ok(())
+    }
+
+    async fn update(&mut self, force_update: bool) -> Result<CourtMeta, DbError> {
+        log::debug!("{}: Checking for update", self.name);
+
+        if let Some(meta) = self.database.get_court_meta(&self.name).await? {
             if !force_update && !is_out_of_date(meta.last_update) {
                 log::debug!("{}: Already up to date", self.name);
-                return Ok(maybe_meta.unwrap());
+                return Ok(meta);
             }
         }
 
         log::info!("{}: Out of date, updating", self.name);
 
         let last_update = Utc::now(); // Better have last_update too old than too new
-        let new_info: Result<_, ()> = scraper::get_court_info(&self.name)
+        let new_data = scraper::get_court_data(&self.name)
             .await
-            .map_err(|e| log::warn!("Failed to get info for court {}: {e}", &self.name));
+            .map_err(|e| log::warn!("Failed to get info for court {}: {e}", &self.name))
+            .ok();
 
-        if let Ok(CourtInfo {
-            schedule: new_schedule,
-            full_name,
-        }) = &new_info
-        {
-            let old_schedule = self.database.get_sessions(&self.name, None, None).await?;
-
-            for sub in self
-                .database
-                .get_confirmed_subscriptions_by_court(&self.name)
-                .await?
-            {
-                let Some(msg) = messages::handle_update(
-                    &old_schedule,
-                    new_schedule,
-                    full_name,
-                    &sub.name,
-                    &sub.reference_filter,
-                ) else {
-                    continue;
-                };
-                self.notify.send(ChatId(sub.chat_id), msg, None);
-            }
+        if let Some(new_data) = &new_data {
+            self.process_new_data(new_data).await?;
         }
 
-        let schedule = new_info.as_ref().ok().map(|x| &x.schedule[..]);
-        let full_name = new_info.as_ref().ok().map(|x| &x.full_name[..]);
+        let sessions = new_data.as_ref().map(|x| &x.sessions[..]);
+        let meta = CourtMeta {
+            last_update,
+            full_name: new_data.as_ref().map(|x| x.full_name.clone()),
+        };
 
         self.database
-            .update_court_info(&self.name, &last_update, full_name, schedule)
+            .update_court_data(&self.name, &meta, sessions)
             .await?;
 
         log::info!("Court {} has been updated", self.name);
 
-        Ok(CourtMeta {
-            last_update,
-            full_name: new_info.ok().map(|x| x.full_name),
-        })
+        Ok(meta)
+    }
+
+    async fn get_court_data(
+        &mut self,
+        date_filter: Option<NaiveDate>,
+    ) -> Result<Option<CourtData>, DbError> {
+        let meta = self.update(false).await?;
+
+        let Some(full_name) = meta.full_name else {
+            // if full_name is None, the website was not available
+            return Ok(None);
+        };
+
+        let sessions = self
+            .database
+            .get_sessions(&self.name, None, date_filter)
+            .await?;
+
+        let court_data = CourtData {
+            full_name,
+            sessions,
+        };
+
+        Ok(Some(court_data))
     }
 
     async fn handle_update(&mut self, force_update: bool) {
@@ -112,44 +153,18 @@ impl CourtWorker {
         }
     }
 
-    async fn update_and_get(
-        &mut self,
-        date_filter: Option<NaiveDate>,
-    ) -> Result<Option<CourtInfo>, DbError> {
-        let meta = self.update(false).await?;
-
-        let info = match meta.full_name {
-            None => None,
-            Some(full_name) => {
-                let schedule = self
-                    .database
-                    .get_sessions(&self.name, None, date_filter)
-                    .await?;
-                Some(CourtInfo {
-                    full_name,
-                    schedule,
-                })
-            }
-        };
-
-        Ok(info)
-    }
-
-    async fn database_error(&self, e: DbError, msg: &teloxide::types::Message) {
-        log::error!("Database error: {e}");
-        let _ = self
-            .notify
-            .send_direct(msg.chat.id, messages::internal_error(), Some(msg.id))
-            .await;
-    }
-
     async fn handle_get_sessions(
         &mut self,
         message: teloxide::types::Message,
         date: String,
         reference: String,
     ) {
-        let Some(date) = DateFilter::new(&date) else {
+        let date = if &date == "*" {
+            None
+        } else if let Ok(date) = NaiveDate::parse_from_str(&date, "%d.%m.%Y") {
+            Some(date)
+        } else {
+            // Invalid date in input
             let _ = self
                 .notify
                 .send_direct(message.chat.id, messages::invalid_date(), Some(message.id))
@@ -157,15 +172,9 @@ impl CourtWorker {
             return;
         };
 
-        let info = match self.update_and_get(date.date).await {
-            Ok(info) => info,
-            Err(e) => {
-                self.database_error(e, &message).await;
-                return;
-            }
-        };
+        let data = handle_db_error!(self.get_court_data(date).await, self, message);
 
-        let msg = messages::list_sessions(&info, &reference);
+        let msg = messages::list_sessions(&data, &reference);
 
         self.notify
             .send_direct(message.chat.id, msg, Some(message.id))
@@ -177,39 +186,31 @@ impl CourtWorker {
         message: teloxide::types::Message,
         subscription_id: i64,
     ) {
-        let sub = match self.database.get_subscription_by_id(subscription_id).await {
-            Ok(Some(sub)) => sub,
-            Ok(None) => {
-                log::info!("Subscription {subscription_id} does not exist, already deleted?");
-                return;
-            }
-            Err(e) => {
-                self.database_error(e, &message).await;
-                return;
-            }
+        let sub = handle_db_error!(
+            self.database.get_subscription_by_id(subscription_id).await,
+            self,
+            message
+        );
+
+        let Some(sub) = sub else {
+            log::info!("Subscription {subscription_id} does not exist, already deleted?");
+            return;
         };
 
-        let info = match self.update_and_get(None).await {
-            Ok(info) => info,
-            Err(e) => {
-                self.database_error(e, &message).await;
-                return;
-            }
-        };
-
-        let msg = messages::subscribed(&sub.name, &info, &sub.reference_filter);
+        let data = handle_db_error!(self.get_court_data(None).await, self, message);
+        let msg = messages::subscribed(&sub.name, &data, &sub.reference_filter);
 
         self.notify
             .send_direct(message.chat.id, msg, Some(message.id))
             .await;
 
-        if let Err(e) = self
-            .database
-            .set_subscription_confirmation_sent(subscription_id)
-            .await
-        {
-            self.database_error(e, &message).await;
-        }
+        handle_db_error!(
+            self.database
+                .set_subscription_confirmation_sent(subscription_id)
+                .await,
+            self,
+            message
+        );
     }
 
     async fn run(mut self) {
@@ -301,12 +302,12 @@ impl Courts {
             database,
         };
 
-        this.init_subscribed().await;
+        this.init_subscribed_courts().await;
 
         this
     }
 
-    pub async fn init_subscribed(&mut self) {
+    pub async fn init_subscribed_courts(&mut self) {
         match self.database.get_subscribed_courts().await {
             Ok(names) => {
                 for name in names {
@@ -317,7 +318,7 @@ impl Courts {
                 }
             }
             Err(e) => {
-                log::error!("Database error, can't init court workers: {e}")
+                log::error!("Database error, cannot init court workers: {e}")
             }
         };
     }

@@ -1,26 +1,10 @@
 use std::collections::HashSet;
 
-use chrono::NaiveDate;
 use regex::Regex;
 use teloxide::utils::markdown::{bold, code_inline, escape};
 
 use crate::database::Subscription;
-use crate::scraper::{CourtInfo, Schedule, Session};
-
-pub struct DateFilter {
-    pub date: Option<NaiveDate>,
-}
-
-impl DateFilter {
-    pub fn new(s: &str) -> Option<Self> {
-        if s == "*" {
-            return Some(Self { date: None });
-        }
-
-        let date = NaiveDate::parse_from_str(s, "%d.%m.%Y").ok()?;
-        Some(DateFilter { date: Some(date) })
-    }
-}
+use crate::scraper::{CourtData, Session};
 
 struct ReferenceFilter {
     regex: Regex,
@@ -39,7 +23,7 @@ impl ReferenceFilter {
 }
 
 pub fn session_info(entry: &Session) -> String {
-    let datetime = format!("{}, {}", entry.date.format("%A, %-d %B %C%y"), entry.time);
+    let datetime = format!("{}, {}", entry.date.format("%A, %-d. %B %C%y"), entry.time);
 
     let byline = if entry.lawsuit.is_empty() {
         entry.r#type.clone()
@@ -66,10 +50,10 @@ pub fn session_info(entry: &Session) -> String {
     result
 }
 
-pub fn create_list(schedule: &Schedule, filter: impl Fn(&Session) -> bool) -> (u64, String) {
+pub fn create_list(sessions: &[Session], filter: impl Fn(&Session) -> bool) -> (u64, String) {
     let mut result = String::new();
     let mut count = 0;
-    for session in schedule {
+    for session in sessions {
         if !filter(session) {
             continue;
         }
@@ -87,42 +71,42 @@ pub fn invalid_date() -> String {
     escape("Das angegebene Datum ist ungültig.")
 }
 
-pub fn list_sessions(info: &Option<CourtInfo>, reference: &str) -> String {
-    let Some(info) = info else {
+pub fn list_sessions(court_data: &Option<CourtData>, reference: &str) -> String {
+    let Some(court_data) = court_data else {
         return escape("Leider sind keine Informationen für dieses Gericht verfügbar.");
     };
 
     let reference = ReferenceFilter::new(reference);
 
-    let (count, list) = create_list(&info.schedule, |session| {
+    let (count, list) = create_list(&court_data.sessions, |session| {
         reference.matches(&session.reference)
     });
 
     match count {
         0 => format!(
             "Leider wurden keine Termine für das {}, die zu deinem Filter passen, gefunden\\.",
-            bold(&escape(&info.full_name))
+            bold(&escape(&court_data.full_name))
         ),
         1 => format!(
             "Es wurde 1 Termin für das {} gefunden:{}",
-            bold(&escape(&info.full_name)),
+            bold(&escape(&court_data.full_name)),
             list
         ),
         _ => format!(
             "Es wurden {} Termine für das {} gefunden:{}",
             escape(&count.to_string()),
-            bold(&escape(&info.full_name)),
+            bold(&escape(&court_data.full_name)),
             list
         ),
     }
 }
 
-pub fn subscribed(name: &str, court_info: &Option<CourtInfo>, reference: &str) -> String {
+pub fn subscribed(name: &str, court_data: &Option<CourtData>, reference: &str) -> String {
     let mut result = escape(&format!("Dein Abo „{name}” wurde entgegengenommen."));
-    match court_info {
-        Some(info) => {
+    match court_data {
+        Some(data) => {
             let reference = ReferenceFilter::new(reference);
-            let (count, list) = create_list(&info.schedule, |session| {
+            let (count, list) = create_list(&data.sessions, |session| {
                 reference.matches(&session.reference)
             });
 
@@ -160,7 +144,13 @@ pub fn list_subscriptions(list: &[Subscription]) -> String {
         escape("Hier ist eine Liste deiner Abos:\n\n")
             + &list
                 .iter()
-                .map(|s| bold(&escape(&s.name)) + &escape(&format!("\nGericht: {}\nAktenzeichen: {}", s.court, s.reference_filter)))
+                .map(|s| {
+                    bold(&escape(&s.name))
+                        + &escape(&format!(
+                            "\nGericht: {}\nAktenzeichen: {}",
+                            s.court, s.reference_filter
+                        ))
+                })
                 .collect::<Vec<_>>()
                 .join("\n\n")
     }
@@ -174,18 +164,18 @@ pub fn unsubscribed(removed: bool) -> String {
     }
 }
 
-pub fn handle_update(
-    old_schedule: &Schedule,
-    new_schedule: &Schedule,
+pub fn sessions_updated(
+    old_sessions: &[Session],
+    new_sessions: &[Session],
     full_court_name: &str,
     subscription_name: &str,
     reference_filter: &str,
 ) -> Option<String> {
     let reference = ReferenceFilter::new(reference_filter);
 
-    let old_sessions: HashSet<_> = old_schedule.iter().collect();
+    let old_sessions: HashSet<_> = old_sessions.iter().collect();
 
-    let (count, list) = create_list(new_schedule, |session| {
+    let (count, list) = create_list(new_sessions, |session| {
         reference.matches(&session.reference) && !old_sessions.contains(&session)
     });
 
@@ -195,7 +185,9 @@ pub fn handle_update(
 
     let msg = escape("🔔 Für dein Abo „")
         + &bold(&escape(subscription_name))
-        + &escape(&format!("” ({full_court_name}) wurden neue Termine veröffentlicht!"))
+        + &escape(&format!(
+            "” ({full_court_name}) wurden neue Termine veröffentlicht!"
+        ))
         + &list;
 
     Some(msg)
