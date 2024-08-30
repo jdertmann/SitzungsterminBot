@@ -154,12 +154,16 @@ pub fn subscription_exists(name: &str) -> String {
 }
 
 pub fn list_subscriptions(list: &[Subscription]) -> String {
-    escape("Hier ist eine Liste deiner Abos:\n\n")
-        + &list
-            .iter()
-            .map(|s| bold(&escape(&s.name)) + &escape(&format!("\nGericht: {}\nAktenzeichen: {}", s.court, s.reference_filter)))
-            .collect::<Vec<_>>()
-            .join("\n\n")
+    if list.is_empty() {
+        escape("Du hast zur Zeit keine Abos am laufen!")
+    } else {
+        escape("Hier ist eine Liste deiner Abos:\n\n")
+            + &list
+                .iter()
+                .map(|s| bold(&escape(&s.name)) + &escape(&format!("\nGericht: {}\nAktenzeichen: {}", s.court, s.reference_filter)))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+    }
 }
 
 pub fn unsubscribed(removed: bool) -> String {
