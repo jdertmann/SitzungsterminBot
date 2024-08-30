@@ -98,6 +98,8 @@ impl CourtWorker {
             .update_court_info(&self.name, &last_update, full_name, schedule)
             .await?;
 
+        log::info!("Court {} has been updated", self.name);
+
         Ok(CourtMeta {
             last_update,
             full_name: new_info.ok().map(|x| x.full_name),
