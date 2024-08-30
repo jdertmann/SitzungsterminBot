@@ -154,6 +154,10 @@ pub fn subscribed(name: &str, court_info: &Option<CourtInfo>, reference: &str) -
     result
 }
 
+pub fn subscription_exists(name: &str) -> String {
+    escape("Ein Abo mit diesem Namen existiert bereits!")
+}
+
 pub fn list_subscriptions(list: &[Subscription]) -> String {
     escape("Deine Abos:\n\n")
         + &list

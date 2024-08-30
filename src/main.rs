@@ -194,21 +194,26 @@ async fn main() {
                         court,
                         reference,
                     } => {
-                        get_court!(court); // assert name valid
-                        let subscription_id = match database
+                        get_court!(court); // assert name is valid
+                        let reply = match database
                             .add_subscription(msg.chat.id, &court, &name, &reference)
                             .await
                         {
-                            Ok(id) => id,
-                            Err(e) => {
-                                log::error!("Database error: {e}");
-                                bot.send_message(msg.chat.id, messages::internal_error())
-                                    .reply_parameters(ReplyParameters::new(msg.id))
-                                    .await?;
+                            Ok(Some(subscription_id)) => {
+                                get_court!(court).confirm_subscription(msg, subscription_id);
                                 return Ok(());
                             }
+                            Ok(None) => messages::subscription_exists(&name),
+                            Err(e) => {
+                                log::error!("Database error: {e}");
+                                messages::internal_error()
+                            }
                         };
-                        get_court!(court).confirm_subscription(msg, subscription_id)
+                        bot.send_message(msg.chat.id, reply)
+                            .reply_parameters(ReplyParameters::new(msg.id))
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .await?;
+                        return Ok(());
                     }
                     Command::ListSubscriptions => {
                         let reply = match database.get_subscriptions_by_chat(msg.chat.id).await {
@@ -220,6 +225,7 @@ async fn main() {
                         };
 
                         bot.send_message(msg.chat.id, reply)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                             .reply_parameters(ReplyParameters::new(msg.id))
                             .await?;
                         return Ok(());
@@ -234,6 +240,7 @@ async fn main() {
                         };
 
                         bot.send_message(msg.chat.id, reply)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                             .reply_parameters(ReplyParameters::new(msg.id))
                             .await?;
                         return Ok(());

@@ -30,8 +30,23 @@ impl Database {
         court: &str,
         name: &str,
         reference_filter: &str,
-    ) -> Result<i64, Error> {
-        query!(
+    ) -> Result<Option<i64>, Error> {
+        let mut transaction = self.pool.begin().await?;
+
+        let exists: i64 = query_scalar!(
+            "SELECT COUNT(*) FROM subscriptions WHERE chat_id = ? AND name = ?",
+            chat_id.0,
+            name
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        if exists > 0 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+
+        let id = query!(
             "INSERT INTO subscriptions (chat_id, court, name, reference_filter)
             VALUES (?, ?, ?, ?)",
             chat_id.0,
@@ -39,9 +54,13 @@ impl Database {
             name,
             reference_filter
         )
-        .execute(&self.pool)
-        .await
-        .map(|r| r.last_insert_rowid())
+        .execute(&mut *transaction)
+        .await?
+        .last_insert_rowid();
+
+        transaction.commit().await?;
+
+        Ok(Some(id))
     }
 
     pub async fn get_subscription_by_id(
