@@ -1,17 +1,22 @@
-mod database;
+mod database_sql;
 
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
 use chrono::prelude::*;
-use database::Database;
-use redis::RedisResult;
-use serde::{Deserialize, Serialize};
+use database_sql::CourtMeta;
+use lazy_static::lazy_static;
+use regex::Regex;
 use teloxide::types::ChatId;
+use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::SendError;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
-use crate::chat_list::ChatData;
+use self::database_sql::{Database, Error as DbError};
+use crate::messages::DateFilter;
+use crate::scraper::CourtInfo;
 use crate::{messages, scraper, MessageSender};
 
 pub const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(8, 0, 0);
@@ -37,13 +42,6 @@ fn is_out_of_date(last_update: DateTime<Utc>) -> bool {
     return last_update < treshold;
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
-struct Subscription {
-    name: String,
-    chat_id: ChatId,
-    reference: String,
-}
-
 struct CourtWorker {
     name: String,
     message_rx: mpsc::UnboundedReceiver<Message>,
@@ -52,135 +50,166 @@ struct CourtWorker {
     database: Database,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
-
-struct CourtState {
-    last_update: DateTime<Utc>,
-    info: Result<scraper::CourtInfo, ()>,
-}
-
 impl CourtWorker {
-    async fn update_and_get(&mut self, force_update: bool) -> RedisResult<CourtState> {
+    async fn update(&mut self, force_update: bool) -> Result<CourtMeta, DbError> {
         log::debug!("{}: Check for update", self.name);
-        let maybe_state = self.database.load_court_state().await?;
 
-        if let Some(state) = &maybe_state {
-            if !force_update && !is_out_of_date(state.last_update) {
+        let maybe_meta = self.database.get_court_meta(&self.name).await?;
+        if let Some(meta) = dbg!(&maybe_meta) {
+            if !force_update && !is_out_of_date(meta.last_update) {
                 log::debug!("{}: Already up to date", self.name);
-                return Ok(maybe_state.unwrap());
+                return Ok(maybe_meta.unwrap());
             }
         }
-        log::info!("{}: Running update", self.name);
-        let last_update = Utc::now(); // Better have last_update too old than too new
 
+        log::info!("{}: Out of date, updating", self.name);
+
+        let last_update = Utc::now(); // Better have last_update too old than too new
         let new_info: Result<_, ()> = scraper::get_court_info(&self.name)
             .await
             .map_err(|e| log::warn!("Failed to get info for court {}: {e}", &self.name));
 
-        let new_state = CourtState {
-            info: new_info,
-            last_update,
-        };
+        if let Ok(CourtInfo {
+            schedule: new_schedule,
+            full_name,
+        }) = &new_info
+        {
+            let old_schedule = self.database.get_sessions(&self.name, None, None).await?;
 
-        if Some(&new_state.info) != maybe_state.as_ref().map(|x| &x.info) {
-            let old_info = match maybe_state {
-                Some(state) => state.info,
-                None => Err(()),
-            };
-
-            for sub in self.database.load_subscriptions().await? {
-                let Some(msg) =
-                    messages::handle_update(&old_info, &new_state.info, &sub.name, &sub.reference)
-                else {
+            for sub in self
+                .database
+                .get_confirmed_subscriptions_by_court(&self.name)
+                .await?
+            {
+                let Some(msg) = messages::handle_update(
+                    &old_schedule,
+                    new_schedule,
+                    full_name,
+                    &sub.name,
+                    &sub.reference_filter,
+                ) else {
                     continue;
                 };
-                self.notify.send(sub.chat_id, msg, None);
+                self.notify.send(ChatId(sub.chat_id), msg, None);
             }
         }
 
-        self.database.save_court_state(&new_state).await?;
+        let schedule = new_info.as_ref().ok().map(|x| &x.schedule[..]);
+        let full_name = new_info.as_ref().ok().map(|x| &x.full_name[..]);
+        dbg!(full_name);
+        self.database
+            .update_court_info(&self.name, &last_update, full_name, schedule)
+            .await?;
 
-        Ok(new_state)
+        Ok(CourtMeta {
+            last_update,
+            full_name: new_info.ok().map(|x| x.full_name),
+        })
     }
 
-    async fn handle_update(&mut self, force: bool) {
-        let _ = self.update_and_get(force).await.inspect_err(|e| log::error!("Update failed: {e}"));
+    async fn handle_update(&mut self, force_update: bool) {
+        if let Err(e) = self.update(force_update).await {
+            log::error!("Update failed: {e}")
+        }
+    }
+
+    async fn update_and_get(
+        &mut self,
+        date_filter: Option<NaiveDate>,
+    ) -> Result<Option<CourtInfo>, DbError> {
+        let meta = self.update(false).await?;
+
+        let info = match meta.full_name {
+            None => None,
+            Some(full_name) => {
+                let schedule = self
+                    .database
+                    .get_sessions(&self.name, None, date_filter)
+                    .await?;
+                Some(CourtInfo {
+                    full_name,
+                    schedule,
+                })
+            }
+        };
+
+        Ok(info)
+    }
+
+    async fn database_error(&self, e: DbError, msg: &teloxide::types::Message) {
+        log::error!("Database error: {e}");
+        let _ = self.notify
+            .send_direct(msg.chat.id, messages::internal_error(), Some(msg.id)).await;
     }
 
     async fn handle_get_sessions(
         &mut self,
         message: teloxide::types::Message,
-        chat: ChatData,
         date: String,
         reference: String,
     ) {
-        let msg = match self.update_and_get(false).await {
-            Ok(state) => messages::list_sessions(&state.info, &reference, &date),
-            Err(e) => {
-                log::warn!("Failed to retrieve state: {e}");
-                messages::internal_error()
-            }
-        };
-
-        self.notify
-            .send_direct(chat.get_id(), msg, Some(message.id))
-            .await;
-    }
-
-    async fn handle_add_subscription(
-        &mut self,
-        message: teloxide::types::Message,
-        chat: ChatData,
-        name: String,
-        reference: String,
-    ) {
-        let Ok(state) = self.update_and_get(false).await else {
-            self.notify
-                .send_direct(chat.get_id(), messages::internal_error(), Some(message.id))
+        let Some(date) = DateFilter::new(&date) else {
+            let _ = self
+                .notify
+                .send_direct(message.chat.id, messages::invalid_date(), Some(message.id))
                 .await;
             return;
         };
 
-        let sub = Subscription {
-            chat_id: chat.get_id(),
-            name,
-            reference,
-        };
-
-        let msg = match self.database.save_subscription(&sub).await {
-            Ok(()) => messages::subscribed(&sub.name, &state.info, &sub.reference),
+        let info = match self.update_and_get(date.date).await {
+            Ok(info) => info,
             Err(e) => {
-                log::warn!("Failed to save subscription: {e}");
-                messages::internal_error()
+                self.database_error(e, &message).await;
+                return;
             }
         };
 
+        let msg = messages::list_sessions(&info, &reference);
+
         self.notify
-            .send_direct(chat.get_id(), msg, Some(message.id))
+            .send_direct(message.chat.id, msg, Some(message.id))
             .await;
     }
 
-    async fn handle_remove_subscription(
+    async fn handle_confirm_subscription(
         &mut self,
         message: teloxide::types::Message,
-        chat: ChatData,
-        name: String,
+        subscription_id: i64,
     ) {
-        let msg = match self
-            .database
-            .remove_subscription(&name, chat.get_id())
-            .await
-        {
-            Ok(n) => messages::unsubscribed(n),
+        let sub = match self.database.get_subscription_by_id(subscription_id).await {
+            Ok(Some(sub)) => sub,
+            Ok(None) => {
+                log::info!("Subscription {subscription_id} does not exist, already deleted?");
+                return;
+            }
             Err(e) => {
-                log::warn!("Failed to remove subscription: {e}");
-                messages::internal_error()
+                self.database_error(e, &message).await;
+                return;
             }
         };
 
+        let info = match self.update_and_get(None).await {
+            Ok(info) => info,
+            Err(e) => {
+                self.database_error(e, &message).await;
+                return;
+            }
+        };
+
+        let msg = messages::subscribed(&sub.name, &info, &sub.reference_filter);
+
         self.notify
-            .send_direct(chat.get_id(), msg, Some(message.id))
+            .send_direct(message.chat.id, msg, Some(message.id))
             .await;
+
+        if let Err(e) = self
+            .database
+            .set_subscription_confirmation_sent(subscription_id)
+            .await
+        {
+            self.database_error(e, &message).await;
+            return;
+        }
     }
 
     async fn run(mut self) {
@@ -188,32 +217,29 @@ impl CourtWorker {
             tokio::select! {
                 _ = self.auto_update.tick() => self.handle_update(false).await,
                 msg = self.message_rx.recv() => {
-                    let Some(msg) = msg else {break};
+                    let Some(msg) = msg else {
+                        // channel closed, no more messages
+                        break
+                    };
                     match msg {
                         Message::Update { force } => self.handle_update(force).await,
                         Message::GetSessions {
                             message,
-                            chat,
                             date,
                             reference,
                         } => {
-                            self.handle_get_sessions(message, chat, date, reference)
+                            self.handle_get_sessions(message, date, reference)
                                 .await
                         }
-                        Message::AddSubscription {
+                        Message::ConfirmSubscription {
                             message,
-                            chat,
-                            name,
-                            reference,
+                            subscription_id
                         } => {
-                            self.handle_add_subscription(message, chat, name, reference)
-                                .await
+                            self.handle_confirm_subscription(message, subscription_id).await
                         }
-                        Message::RemoveSubscription {
-                            message,
-                            chat,
-                            name,
-                        } => self.handle_remove_subscription(message, chat, name).await,
+                        Message::Close => {
+                            self.message_rx.close();
+                        }
                     }
                 }
             }
@@ -227,101 +253,133 @@ enum Message {
     },
     GetSessions {
         message: teloxide::types::Message,
-        chat: ChatData,
         date: String,
         reference: String,
     },
-    AddSubscription {
+    ConfirmSubscription {
         message: teloxide::types::Message,
-        chat: ChatData,
-        name: String,
-        reference: String,
+        subscription_id: i64,
     },
-    RemoveSubscription {
-        message: teloxide::types::Message,
-        chat: ChatData,
-        name: String,
-    },
+    Close,
 }
 
-#[derive(Clone)]
-pub struct Court {
+struct Court {
     message_tx: mpsc::UnboundedSender<Message>,
 }
 
-impl Court {
-    pub fn new(name: String, notify: MessageSender, redis: redis::Client) -> Self {
+impl Drop for Court {
+    fn drop(&mut self) {
+        let _ = self.message_tx.send(Message::Close);
+    }
+}
+
+pub struct Courts {
+    courts: HashMap<String, Court>,
+    notification_queue: MessageSender,
+    database_url: String
+}
+
+pub struct CourtRef<'a> {
+    courts: &'a mut Courts,
+    name: &'a str
+}
+
+#[derive(Debug, Error)]
+#[error("invalid court name")]
+pub struct InvalidCourtName(());
+
+lazy_static! {
+    static ref COURT_NAME_REGEX: Regex = Regex::new("^[a-zA-Z0-9\\-]{1,63}$").unwrap();
+}
+
+impl Courts {
+    pub fn new(notification_queue: MessageSender, database_url: String) -> Self {
+        Self {
+            notification_queue,
+            courts: Default::default(),
+            database_url
+        }
+    }
+
+    pub fn get<'a>(&'a mut self, court_name: &'a str) -> Result<CourtRef<'a>, InvalidCourtName> {
+        if !COURT_NAME_REGEX.is_match(court_name) {
+            return Err(InvalidCourtName(()));
+        }
+        Ok(CourtRef {
+            courts: self,
+            name: court_name
+        })
+    }
+}
+
+impl<'a> CourtRef<'a> {
+    fn create(&self) -> Court {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-        let database = Database::new(redis, &name);
         let period = {
             // to avoid peaks all 5 minutes, make the period "random"
             let mut hash = DefaultHasher::new();
-            name.hash(&mut hash);
+            self.name.hash(&mut hash);
             Duration::from_secs(270 + hash.finish() % 60)
         };
+
         let mut auto_update = interval_at(Instant::now() + period, period);
         auto_update.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        let worker = CourtWorker {
-            name,
-            message_rx,
-            notify,
-            auto_update,
-            database,
-        };
+        let name = self.name.to_string();
+        let notify = self.courts.notification_queue.clone();
+        let database_url = self.courts.database_url.clone();
 
-        tokio::spawn(worker.run());
+        tokio::spawn(async move {
+            let database =
+                database_sql::Database::new(&database_url).await?;
+            let worker = CourtWorker {
+                name,
+                message_rx,
+                notify,
+                auto_update,
+                database,
+            };
+            Ok::<_, DbError>(worker.run().await)
+        });
 
         Court { message_tx }
     }
 
-    pub fn update(&self, force: bool) {
-        let _ = self.message_tx.send(Message::Update { force });
+
+    fn send_msg(&mut self, mut msg: Message) {
+        if let Some(court) = self.courts.courts.get(self.name) {
+            match court.message_tx.send(msg) {
+                Ok(_) => return,
+                Err(SendError(msg_cp)) => {
+                    log::warn!(
+                        "cannot send message to court worker task {}, recreating ...",
+                        self.name
+                    );
+                    msg = msg_cp
+                }
+            }
+        }
+        
+
+        let court = self.create();
+        match court.message_tx.send(msg) {
+            Ok(_) => (),
+            Err(_) => log::error!("cannot send message to court worker task {}!", self.name),
+        }
+
+        self.courts.courts.insert(self.name.to_string(), court);
     }
 
-    pub fn get_sessions(
-        &self,
-        message: teloxide::types::Message,
-        chat: ChatData,
-        date: String,
-        reference: String,
-    ) {
-        let msg = Message::GetSessions {
-            message,
-            chat,
-            date,
-            reference,
-        };
-        let _ = self.message_tx.send(msg);
+    pub fn get_sessions(&mut self, message: teloxide::types::Message, date: String, reference: String ) {
+        self.send_msg(Message::GetSessions { message, date, reference })
     }
-
-    pub fn add_subscription(
-        &self,
-        message: teloxide::types::Message,
-        chat: ChatData,
-        name: String,
-        reference: String,
-    ) {
-        let msg = Message::AddSubscription {
-            message,
-            chat,
-            name,
-            reference,
-        };
-        let _ = self.message_tx.send(msg);
+    
+    pub fn confirm_subscription(&mut self, message: teloxide::types::Message, subscription_id: i64 ) {
+        self.send_msg(Message::ConfirmSubscription { message, subscription_id })
     }
-
-    pub fn remove_subscription(
-        &self,
-        message: teloxide::types::Message,
-        chat: ChatData,
-        name: String,
-    ) {
-        let msg = Message::RemoveSubscription {
-            message,
-            chat,
-            name,
-        };
-        let _ = self.message_tx.send(msg);
+    
+    pub fn update(&mut self, force: bool ) {
+        self.send_msg(Message::Update { force })
     }
 }
+

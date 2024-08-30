@@ -4,14 +4,14 @@ use chrono::NaiveDate;
 use regex::Regex;
 use teloxide::utils::markdown::{bold, code_inline, escape};
 
-use crate::scraper::{CourtInfo, Session};
+use crate::scraper::{CourtInfo, Schedule, Session};
 
-struct DateFilter {
-    date: Option<NaiveDate>,
+pub struct DateFilter {
+    pub date: Option<NaiveDate>,
 }
 
 impl DateFilter {
-    fn new(s: &str) -> Option<Self> {
+    pub fn new(s: &str) -> Option<Self> {
         if s == "*" {
             return Some(Self { date: None });
         }
@@ -72,10 +72,10 @@ pub fn session_info(entry: &Session) -> String {
     result
 }
 
-pub fn create_list(info: &CourtInfo, filter: impl Fn(&Session) -> bool) -> (u64, String) {
+pub fn create_list(schedule: &Schedule, filter: impl Fn(&Session) -> bool) -> (u64, String) {
     let mut result = String::new();
     let mut count = 0;
-    for session in &info.schedule {
+    for session in schedule {
         if !filter(session) {
             continue;
         }
@@ -89,18 +89,19 @@ pub fn create_list(info: &CourtInfo, filter: impl Fn(&Session) -> bool) -> (u64,
     (count, result)
 }
 
-pub fn list_sessions(info: &Result<CourtInfo, ()>, reference: &str, date: &str) -> String {
-    let Ok(info) = info else {
+pub fn invalid_date() -> String {
+    escape("Das angegebene Datum ist ungültig.")
+}
+
+pub fn list_sessions(info: &Option<CourtInfo>, reference: &str) -> String {
+    let Some(info) = info else {
         return escape("Leider sind keine Informationen für dieses Gericht verfügbar.");
     };
 
     let reference = ReferenceFilter::new(reference);
-    let Some(date) = DateFilter::new(date) else {
-        return escape("Das angegebene Datum ist ungültig.");
-    };
 
-    let (count, list) = create_list(info, |session| {
-        reference.matches(&session.reference) && date.matches(session.date)
+    let (count, list) = create_list(&info.schedule, |session| {
+        reference.matches(&session.reference)
     });
 
     match count {
@@ -122,12 +123,14 @@ pub fn list_sessions(info: &Result<CourtInfo, ()>, reference: &str, date: &str) 
     }
 }
 
-pub fn subscribed(name: &str, court_info: &Result<CourtInfo, ()>, reference: &str) -> String {
+pub fn subscribed(name: &str, court_info: &Option<CourtInfo>, reference: &str) -> String {
     let mut result = escape(&format!("Dein Abo „{name}” wurde entgegengenommen."));
     match court_info {
-        Ok(info) => {
+        Some(info) => {
             let reference = ReferenceFilter::new(reference);
-            let (count, list) = create_list(info, |session| reference.matches(&session.reference));
+            let (count, list) = create_list(&info.schedule, |session| {
+                reference.matches(&session.reference)
+            });
 
             match count {
                 0 => {
@@ -142,7 +145,7 @@ pub fn subscribed(name: &str, court_info: &Result<CourtInfo, ()>, reference: &st
                 }
             }
         }
-        Err(_) => {
+        None => {
             result += &escape(" Ich kann die Website des Gerichts leider nicht erreichen, aber ich halt dich auf dem Laufenden.");
         }
     }
@@ -159,21 +162,17 @@ pub fn unsubscribed(n: usize) -> String {
 }
 
 pub fn handle_update(
-    old_info: &Result<CourtInfo, ()>,
-    new_info: &Result<CourtInfo, ()>,
-    name: &str,
-    reference: &str,
+    old_schedule: &Schedule,
+    new_schedule: &Schedule,
+    full_court_name: &str,
+    subscription_name: &str,
+    reference_filter: &str,
 ) -> Option<String> {
-    let new_info = new_info.as_ref().ok()?;
+    let reference = ReferenceFilter::new(reference_filter);
 
-    let reference = ReferenceFilter::new(reference);
+    let old_sessions: HashSet<_> = old_schedule.into_iter().collect();
 
-    let old_sessions: HashSet<_> = match old_info {
-        Ok(info) => info.schedule.iter().collect(),
-        Err(_) => HashSet::new(),
-    };
-
-    let (count, list) = create_list(new_info, |session| {
+    let (count, list) = create_list(new_schedule, |session| {
         reference.matches(&session.reference) && !old_sessions.contains(&session)
     });
 
@@ -181,7 +180,12 @@ pub fn handle_update(
         return None;
     }
 
-    Some(escape(&format!("Für dein Abo „{name}” gibt es Neuigkeiten:")) + &list)
+    let msg = escape("Für dein Abo „")
+        + &bold(&escape(subscription_name))
+        + &escape(&format!("” ({full_court_name}) gibt es Neuigkeiten:"))
+        + &list;
+
+    Some(msg)
 }
 
 pub fn internal_error() -> String {

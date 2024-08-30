@@ -18,7 +18,7 @@ pub enum Error {
     ParseError(Cow<'static, str>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Session {
     pub date: NaiveDate,
     pub time: String,

@@ -1,20 +1,21 @@
 mod chat_list;
 mod court;
-mod court_map;
 mod messages;
 mod scraper;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chat_list::ChatData;
 // use chat_list::ChatData;
-use court_map::CourtMap;
+use court::Courts;
+use dptree::deps;
 use teloxide::macros::BotCommands;
-use teloxide::prelude::*;
+use teloxide::{filter_command, prelude::*};
 use teloxide::types::{MessageId, ReplyParameters};
 use teloxide::utils::command::ParseError;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Clone)]
 struct MessageSender {
@@ -132,22 +133,19 @@ async fn main() {
 
     let bot = Bot::from_env();
     let notification_queue = MessageSender::new(bot.clone());
-    let redis = redis::Client::open("redis://127.0.0.1/").unwrap();
-    let court_map = CourtMap::new(notification_queue, redis);
+    let courts = Arc::new(Mutex::new(Courts::new(notification_queue, std::env::var("DATABASE_URL").unwrap())));
 
     //let chat_data : Arc<RwLock<HashMap<ChatId, ChatData>>> = Default::default();
 
-    let answer = move |bot: Bot, msg: Message, cmd: Command| {
-        let court_map = court_map.clone();
-        //let chat_data = chat_data.clone();
+    let answer = |bot: Bot, msg: Message, cmd: Command, courts: Arc<Mutex<Courts>>| {
         async move {
             log::info!("{:?}", cmd);
             let chat_id = msg.chat.id;
             macro_rules! get_court {
                 ($court:expr) => {
-                    match court_map.get(&$court).await {
-                        Some(x) => x,
-                        None => {
+                    match courts.lock().await.get(&$court) {
+                        Ok(x) => x,
+                        Err(_) => {
                             bot.send_message(msg.chat.id, "Ungültiger Gerichtsname!")
                                 .reply_parameters(ReplyParameters::new(msg.id))
                                 .await?;
@@ -167,7 +165,8 @@ async fn main() {
                     court,
                     reference,
                 } => {
-                    get_court!(court).add_subscription(msg, ChatData::new(chat_id), name, reference)
+                    // get_court!(court).confirm_subscription(msg, ChatData::new(chat_id), name, reference)
+                    todo!()
                 }
                 Command::Unsubscribe { name } => {
                     todo!(); //get_court!(court).remove_subscription(msg.chat.id, Some(name), true);
@@ -176,14 +175,18 @@ async fn main() {
                     court,
                     date,
                     reference,
-                } => get_court!(court).get_sessions(msg, ChatData::new(chat_id), date, reference),
+                } => get_court!(court).get_sessions(msg, date, reference),
                 Command::ForceUpdate { court } => get_court!(court).update(true),
             }
-            Ok(())
+            Ok::<(), teloxide::RequestError>(())
         }
     };
 
-    Command::repl(bot, answer).await;
+    Dispatcher::builder(bot, Update::filter_message().filter_command::<Command>().endpoint(answer))
+        .dependencies(deps![courts])
+        .default_handler(|_| async {})
+        .enable_ctrlc_handler()
+        .build().dispatch().await
 }
 
 const HELP_MESSAGE : &str = "
