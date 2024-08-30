@@ -104,9 +104,17 @@ impl Database {
         &self,
         chat_id: ChatId,
     ) -> Result<Vec<Subscription>, Error> {
-        query_as!(
-            Subscription,
-            "SELECT * FROM subscriptions WHERE chat_id = ?",
+        sqlx::query_as(
+            "SELECT
+                COALESCE(c.full_name, s.court) court,
+                s.subscription_id,
+                s.chat_id,
+                s.confirmation_sent,
+                s.name,
+                s.reference_filter
+            FROM subscriptions s LEFT JOIN courts c ON s.court = c.name
+            WHERE s.chat_id = ?"
+        ).bind(
             chat_id.0
         )
         .fetch_all(&self.pool)
@@ -244,16 +252,6 @@ pub struct Subscription {
     pub confirmation_sent: i64,
     pub name: String,
     pub reference_filter: String,
-}
-
-impl std::fmt::Display for Subscription {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: {}, {}",
-            self.name, self.court, self.reference_filter
-        )
-    }
 }
 
 #[derive(Debug, Clone)]

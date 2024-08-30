@@ -154,19 +154,19 @@ pub fn subscription_exists(name: &str) -> String {
 }
 
 pub fn list_subscriptions(list: &[Subscription]) -> String {
-    escape("Deine Abos:\n\n")
+    escape("Hier ist eine Liste deiner Abos:\n\n")
         + &list
             .iter()
-            .map(ToString::to_string)
+            .map(|s| bold(&escape(&s.name)) + &escape(&format!("\nGericht: {}\nAktenzeichen: {}", s.court, s.reference_filter)))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n\n")
 }
 
 pub fn unsubscribed(removed: bool) -> String {
     if removed {
         escape("Abo wurde gelöscht 👍")
     } else {
-        escape("Es wurde kein Abo mit dem Namen gefunden.")
+        escape("Es wurde kein Abo mit diesem Namen gefunden.")
     }
 }
 
@@ -189,9 +189,9 @@ pub fn handle_update(
         return None;
     }
 
-    let msg = escape("Für dein Abo „")
+    let msg = escape("🔔 Für dein Abo „")
         + &bold(&escape(subscription_name))
-        + &escape(&format!("” ({full_court_name}) gibt es Neuigkeiten:"))
+        + &escape(&format!("” ({full_court_name}) wurden neue Termine veröffentlicht!"))
         + &list;
 
     Some(msg)
