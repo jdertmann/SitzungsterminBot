@@ -7,7 +7,6 @@ use lazy_static::lazy_static;
 use scraper::selectable::Selectable;
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
-use teloxide::requests;
 use thiserror::Error;
 use tokio::task::spawn_blocking;
 
