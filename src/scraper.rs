@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::time::Duration;
 
 use chrono::prelude::*;
 use chrono_tz::Europe;
@@ -6,6 +7,7 @@ use lazy_static::lazy_static;
 use scraper::selectable::Selectable;
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
+use teloxide::requests;
 use thiserror::Error;
 use tokio::task::spawn_blocking;
 
@@ -47,10 +49,10 @@ lazy_static! {
     static ref DATES_SELECTOR: Selector = Selector::parse("#startDate > option").unwrap();
 }
 
-async fn parse_index_page(url_name: &str) -> Result<(String, Vec<(NaiveDate, String)>), Error> {
+async fn parse_index_page(url_name: &str, client: &reqwest::Client) -> Result<(String, Vec<(NaiveDate, String)>), Error> {
     let url = get_url(url_name);
     log::info!("Get site {url}");
-    let result = reqwest::get(url).await?;
+    let result = client.get(url).send().await?;
     let html = result.text().await?;
     let name = url_name.to_string();
 
@@ -113,9 +115,9 @@ fn parse_row(tr: ElementRef, date: NaiveDate) -> Session {
     }
 }
 
-async fn parse_table(url: &str, date: NaiveDate) -> Result<Vec<Session>, Error> {
+async fn parse_table(url: &str, date: NaiveDate, client: &reqwest::Client) -> Result<Vec<Session>, Error> {
     log::info!("Get site {url}");
-    let result = reqwest::get(url).await?;
+    let result = client.get(url).send().await?;
     let html = result.text().await?;
 
     spawn_blocking(move || {
@@ -145,11 +147,12 @@ pub struct CourtInfo {
 }
 
 pub async fn get_court_info(url_name: &str) -> Result<CourtInfo, Error> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
     let mut schedule = Vec::new();
-    let (full_name, urls) = parse_index_page(url_name).await?;
+    let (full_name, urls) = parse_index_page(url_name, &client).await?;
     log::debug!("Found urls: {:?}", urls);
     for (date, url) in urls {
-        schedule.extend(parse_table(&url, date).await?)
+        schedule.extend(parse_table(&url, date, &client).await?)
     }
 
     Ok(CourtInfo {
