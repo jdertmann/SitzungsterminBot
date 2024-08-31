@@ -17,6 +17,6 @@ serde = "1"
 serde_json = "*"
 shlex = "1.3"
 sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-native-tls", "any", "macros", "chrono", "sqlite", "migrate" ] }
-teloxide = { version = "0.13", features = ["macros"] }
+teloxide = { version = "0.13", features = ["macros", "throttle"] }
 thiserror="1"
 tokio = { version = "1.39", features = ["rt", "macros", "rt-multi-thread", "sync"] }

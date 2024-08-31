@@ -10,12 +10,11 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
 use crate::database::Database;
 use crate::messages::MarkdownString;
-use crate::reply_queue::ReplyQueue;
+use crate::Bot;
 
 enum Message {
     Update {
@@ -44,32 +43,28 @@ impl Drop for Court {
 }
 
 pub trait ReplyFn: Send + 'static {
-    fn reply(self: Box<Self>, msg: MarkdownString) -> BoxFuture<'static, ()>;
+    fn reply(self: Box<Self>, msgs: Vec<MarkdownString>) -> BoxFuture<'static, ()>;
 }
 
 impl<T, F: Future<Output = ()> + Send + 'static> ReplyFn for T
 where
-    T: (FnOnce(MarkdownString) -> F) + Send + 'static,
+    T: (FnOnce(Vec<MarkdownString>) -> F) + Send + 'static,
 {
-    fn reply(self: Box<Self>, msg: MarkdownString) -> BoxFuture<'static, ()> {
+    fn reply(self: Box<Self>, msg: Vec<MarkdownString>) -> BoxFuture<'static, ()> {
         Box::pin(self(msg)) as BoxFuture<'static, ()>
     }
 }
 
 pub struct Courts {
     map: HashMap<String, Court>,
-    reply_queue: ReplyQueue,
-    queue_join_handle: JoinHandle<()>,
+    bot: Bot,
     database: Database,
 }
 
 impl Courts {
-    pub async fn new(bot: crate::Bot, database: Database) -> Self {
-        let (reply_queue, queue_join_handle) = ReplyQueue::new(bot);
-
+    pub async fn new(bot: Bot, database: Database) -> Self {
         let mut this = Self {
-            reply_queue,
-            queue_join_handle,
+            bot,
             map: Default::default(),
             database,
         };
@@ -104,20 +99,6 @@ impl Courts {
             name: court_name,
         })
     }
-
-    pub async fn shutdown(self) {
-        drop(self.map);
-        drop(self.reply_queue);
-
-        // The reasoning is simple: once the courts are dropped,
-        // the channels will be closed, the court workers will run to completion,
-        // and finally all ReplyQueue instances will be dropped.
-        // Eventually, the reply queue task will run to completion.
-        let _ = self
-            .queue_join_handle
-            .await
-            .inspect_err(|e| log::error!("Reply queue task failed! {e}"));
-    }
 }
 
 #[derive(Debug, Error)]
@@ -147,12 +128,12 @@ impl<'a> CourtRef<'a> {
         auto_update.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let name = self.name.to_string();
-        let notify = self.courts.reply_queue.clone();
+        let bot = self.courts.bot.clone();
         let database = self.courts.database.clone();
         let worker = worker::CourtWorker {
             name,
             message_rx,
-            reply_queue: notify,
+            bot,
             auto_update,
             database,
         };

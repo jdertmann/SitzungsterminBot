@@ -5,9 +5,8 @@ use tokio::sync::mpsc;
 use super::Message;
 use crate::database::{CourtMeta, Database, Error as DbError};
 use crate::messages::MarkdownString;
-use crate::reply_queue::ReplyQueue;
 use crate::scraper::CourtData;
-use crate::{messages, scraper};
+use crate::{messages, scraper, send_chain, Bot};
 
 pub const TRESHOLD_TIME: NaiveTime = NaiveTime::from_hms(8, 0, 0);
 
@@ -36,7 +35,7 @@ pub struct CourtWorker {
     pub name: String,
     pub message_rx: mpsc::UnboundedReceiver<Message>,
     pub auto_update: tokio::time::Interval,
-    pub reply_queue: ReplyQueue,
+    pub bot: Bot,
     pub database: Database,
 }
 
@@ -46,7 +45,7 @@ macro_rules! handle_db_error {
             Ok(t) => t,
             Err(e) => {
                 log::error!("Database error: {e}");
-                return messages::internal_error().into();
+                return vec![messages::internal_error().into()];
             }
         }
     };
@@ -61,17 +60,15 @@ impl CourtWorker {
             .await?;
 
         for sub in subscriptions {
-            let Some(msg) = messages::sessions_updated(
+            let msgs = messages::sessions_updated(
                 &old_sessions,
                 &new_data.sessions,
                 &new_data.full_name,
                 &sub.name,
                 &sub.reference_filter,
-            ) else {
-                continue;
-            };
+            );
 
-            self.reply_queue.queue(ChatId(sub.chat_id), msg);
+            send_chain(&self.bot, ChatId(sub.chat_id), msgs).await
         }
 
         Ok(())
@@ -144,14 +141,18 @@ impl CourtWorker {
         }
     }
 
-    async fn handle_get_sessions(&mut self, date: String, reference: String) -> MarkdownString {
+    async fn handle_get_sessions(
+        &mut self,
+        date: String,
+        reference: String,
+    ) -> Vec<MarkdownString> {
         let date = if &date == "*" {
             None
         } else if let Ok(date) = NaiveDate::parse_from_str(&date, "%d.%m.%Y") {
             Some(date)
         } else {
             // Invalid date in input
-            return messages::invalid_date();
+            return vec![messages::invalid_date()];
         };
 
         let data = handle_db_error!(self.get_court_data(date).await);
@@ -159,15 +160,12 @@ impl CourtWorker {
         messages::list_sessions(&data, &reference)
     }
 
-    async fn handle_confirm_subscription(
-        &mut self,
-        subscription_id: i64,
-    ) -> Option<MarkdownString> {
+    async fn handle_confirm_subscription(&mut self, subscription_id: i64) -> Vec<MarkdownString> {
         let sub = handle_db_error!(self.database.get_subscription_by_id(subscription_id).await);
 
         let Some(sub) = sub else {
             log::info!("Subscription {subscription_id} does not exist, already deleted?");
-            return None;
+            return vec![];
         };
 
         let data = handle_db_error!(self.get_court_data(None).await);
@@ -179,7 +177,7 @@ impl CourtWorker {
                 .await
         );
 
-        Some(reply)
+        reply
     }
 
     pub async fn run(mut self) {
@@ -207,9 +205,7 @@ impl CourtWorker {
                             reply_fn
                         } => {
                             let reply = self.handle_confirm_subscription(subscription_id).await;
-                            if let Some(reply) = reply {
-                                reply_fn.reply(reply).await;
-                            }
+                            reply_fn.reply(reply).await;
                         }
                         Message::Close => {
                             self.message_rx.close();

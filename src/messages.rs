@@ -12,6 +12,83 @@ struct ReferenceFilter {
     regex: Regex,
 }
 
+struct Paginator {
+    pages: Vec<Vec<MarkdownString>>,
+    current_page: Vec<MarkdownString>,
+    current_page_len: usize,
+
+    page_nr_max_len: usize,
+    item_limit: usize,
+    char_limit: usize,
+    join: MarkdownString,
+}
+
+impl Paginator {
+    fn page_nr(k: usize, n: usize) -> MarkdownString {
+        format!("[Nachricht {}/{}]", k, n).as_str().into()
+    }
+
+    fn new(item_limit: usize, char_limit: usize, join: MarkdownString) -> Self {
+        let page_nr_max_len = Self::page_nr(999, 999).len_parsed();
+        Self {
+            pages: vec![],
+            current_page: vec![],
+            current_page_len: 0,
+            page_nr_max_len,
+            item_limit,
+            char_limit,
+            join,
+        }
+    }
+
+    fn initial_page_len(&self) -> usize {
+        self.page_nr_max_len
+    }
+
+    fn current_page_len_with(&self, new_item: &MarkdownString) -> usize {
+        self.current_page_len + self.join.len_parsed() + new_item.len_parsed()
+    }
+
+    fn try_push_to_current_page(&mut self, item: MarkdownString) -> Result<(), MarkdownString> {
+        let new_page_len = self.current_page_len_with(&item);
+        if self.current_page.len() < self.item_limit && new_page_len < self.char_limit {
+            self.current_page.push(item);
+            self.current_page_len = new_page_len;
+            Ok(())
+        } else {
+            Err(item)
+        }
+    }
+
+    // Returns false if the item is too long
+    fn push(&mut self, item: MarkdownString) -> Result<(), MarkdownString> {
+        let item = match self.try_push_to_current_page(item) {
+            Ok(()) => return Ok(()),
+            Err(item) => item,
+        };
+
+        // create new page
+        self.pages.push(std::mem::take(&mut self.current_page));
+        self.current_page_len = self.initial_page_len();
+
+        self.try_push_to_current_page(item)
+    }
+
+    fn get_pages(self) -> impl Iterator<Item = MarkdownString> {
+        let mut pages = self.pages;
+        pages.push(self.current_page);
+        let n_pages = pages.len();
+        pages.into_iter().enumerate().map(move |(k, page)| {
+            let mut content = MarkdownString::join(&page, &self.join);
+            if n_pages > 1 {
+                content += &self.join;
+                content += &Self::page_nr(k + 1, n_pages)
+            }
+            content
+        })
+    }
+}
+
 impl ReferenceFilter {
     fn new(s: &str) -> Self {
         let regex_pattern = regex::escape(s).replace(r"\*", ".*").replace(r"\?", ".");
@@ -50,87 +127,102 @@ pub fn session_info(entry: &Session) -> MarkdownString {
     result
 }
 
-pub fn create_list(
-    sessions: &[Session],
-    filter: impl Fn(&Session) -> bool,
-) -> (u64, MarkdownString) {
-    let mut result = MarkdownString::new();
-    let mut count = 0;
-    for session in sessions {
-        if !filter(session) {
-            continue;
-        }
-
-        count += 1;
-
-        result += "\n\n";
-        result += &session_info(session)
-    }
-
-    (count, result)
-}
-
 pub fn invalid_date() -> MarkdownString {
     "Das angegebene Datum ist ungültig.".into()
 }
 
-pub fn list_sessions(court_data: &Option<CourtData>, reference: &str) -> MarkdownString {
+fn list_sessions_prefix(court_data: &CourtData, num_items: usize) -> MarkdownString {
+    let full_name = MarkdownString::from_str(&court_data.full_name).bold();
+    let mut prefix = MarkdownString::new();
+    match num_items {
+        0 => {
+            prefix += "Leider wurden keine Termine für das ";
+            prefix += &full_name;
+            prefix += ", die zu deinem Filter passen, gefunden.";
+        }
+        1 => {
+            prefix += "Es wurde 1 Termin für das ";
+            prefix += &full_name;
+            prefix += " gefunden:";
+        }
+        count => {
+            prefix += &format!("Es wurden {count} Termine für das ");
+            prefix += &full_name;
+            prefix += " gefunden:";
+        }
+    };
+    prefix
+}
+
+pub fn list_sessions(court_data: &Option<CourtData>, reference: &str) -> Vec<MarkdownString> {
     let Some(court_data) = court_data else {
-        return "Leider sind keine Informationen für dieses Gericht verfügbar.".into();
+        return vec!["Leider sind keine Informationen für dieses Gericht verfügbar.".into()];
     };
 
     let reference = ReferenceFilter::new(reference);
 
-    let (count, list) = create_list(&court_data.sessions, |session| {
-        reference.matches(&session.reference)
-    });
+    let items: Vec<_> = court_data
+        .sessions
+        .iter()
+        .filter(|x| reference.matches(&x.reference))
+        .map(session_info)
+        .collect();
 
-    let full_name = MarkdownString::from_str(&court_data.full_name).bold();
-    let mut result = MarkdownString::new();
+    let mut pages = Paginator::new(20, 4096, "\n\n".into());
 
-    match count {
-        0 => {
-            result += "Leider wurden keine Termine für das ";
-            result += &full_name;
-            result += ", die zu deinem Filter passen, gefunden.";
-        }
-        1 => {
-            result += "Es wurde 1 Termin für das ";
-            result += &full_name;
-            result += " gefunden:";
-            result += &list;
-        }
-        _ => {
-            result += &format!("Es wurden {count} Termine für das ");
-            result += &full_name;
-            result += " gefunden:";
-            result += &list;
-        }
+    let prefix = list_sessions_prefix(court_data, items.len());
+    pages.push(prefix).unwrap();
+
+    for item in items {
+        pages
+            .push(item)
+            .unwrap_or_else(|_| pages.push("[Eintrag zu lang]".into()).unwrap());
     }
 
-    result
+    pages.get_pages().collect()
 }
 
-pub fn subscribed(name: &str, court_data: &Option<CourtData>, reference: &str) -> MarkdownString {
-    let mut result = format!("Dein Abo „{name}” wurde entgegengenommen. ")
-        .as_str()
-        .into();
+pub fn subscribed(
+    name: &str,
+    court_data: &Option<CourtData>,
+    reference: &str,
+) -> Vec<MarkdownString> {
+    let mut result = "Dein Abo „".into();
+    result += &MarkdownString::from_str(name).bold();
+    result += "” wurde entgegengenommen. ";
+
     match court_data {
         Some(data) => {
             let reference = ReferenceFilter::new(reference);
-            let (count, list) = create_list(&data.sessions, |session| {
-                reference.matches(&session.reference)
-            });
+            let items: Vec<_> = data
+                .sessions
+                .iter()
+                .filter(|x| reference.matches(&x.reference))
+                .map(session_info)
+                .collect();
 
-            match count {
+            match items.len() {
                 0 => {
                     result +=
                         "Zur Zeit gibt es nichts zu melden, aber ich halt dich auf dem Laufenden!";
                 }
                 _ => {
                     result += "Hier schon mal eine Liste der anstehenden Termine:";
-                    result += &list;
-                    result += "\n\nBei neuen Terminen werde ich dich benachrichtigen!";
+
+                    let mut pages = Paginator::new(20, 4096, "\n\n".into());
+
+                    pages.push(result).unwrap();
+
+                    for item in items {
+                        pages
+                            .push(item)
+                            .unwrap_or_else(|_| pages.push("[Eintrag zu lang]".into()).unwrap());
+                    }
+                    pages
+                        .push("Bei neuen Terminen werde ich dich benachrichtigen!".into())
+                        .unwrap();
+
+                    return pages.get_pages().collect();
                 }
             }
         }
@@ -139,7 +231,7 @@ pub fn subscribed(name: &str, court_data: &Option<CourtData>, reference: &str) -
         }
     }
 
-    result
+    vec![result]
 }
 
 pub fn subscription_exists(name: &str) -> MarkdownString {
@@ -156,16 +248,20 @@ fn subscription_entry(s: &Subscription) -> MarkdownString {
         )
 }
 
-pub fn list_subscriptions(subscriptions: &[Subscription]) -> MarkdownString {
+pub fn list_subscriptions(subscriptions: &[Subscription]) -> Vec<MarkdownString> {
     if subscriptions.is_empty() {
-        "Du hast zur Zeit keine Abos am laufen!".into()
+        vec!["Du hast zur Zeit keine Abos am laufen!".into()]
     } else {
-        let mut result = "Hier ist eine Liste deiner Abos:".into();
+        let mut pages = Paginator::new(20, 4096, "\n\n".into());
+        pages
+            .push("Hier ist eine Liste deiner Abos:".into())
+            .unwrap();
         for sub in subscriptions {
-            result += "\n\n";
-            result += &subscription_entry(sub);
+            pages
+                .push(subscription_entry(sub))
+                .unwrap_or_else(|_| pages.push("[Eintrag zu lang]".into()).unwrap());
         }
-        result
+        pages.get_pages().collect()
     }
 }
 
@@ -184,26 +280,41 @@ pub fn sessions_updated(
     full_court_name: &str,
     subscription_name: &str,
     reference_filter: &str,
-) -> Option<MarkdownString> {
+) -> Vec<MarkdownString> {
     let reference = ReferenceFilter::new(reference_filter);
-
     let old_sessions: HashSet<_> = old_sessions.iter().collect();
 
-    let (count, list) = create_list(new_sessions, |session| {
-        reference.matches(&session.reference) && !old_sessions.contains(&session)
-    });
+    let items: Vec<_> = new_sessions
+        .iter()
+        .filter(|session| reference.matches(&session.reference) && !old_sessions.contains(session))
+        .map(session_info)
+        .collect();
 
-    if count == 0 {
-        return None;
+    if items.len() == 0 {
+        return vec![];
     }
 
-    let mut result = MarkdownString::new();
-    result += "🔔 Für dein Abo „";
-    result += &MarkdownString::from_str(subscription_name).bold();
-    result += &format!("” ({full_court_name}) wurden neue Termine veröffentlicht!");
-    result += &list;
+    let mut prefix = MarkdownString::new();
+    prefix += "🔔 Zu deinem Abo „";
+    prefix += &MarkdownString::from_str(subscription_name).bold();
+    if items.len() == 1 {
+        prefix += &format!("” ({full_court_name}) wurde ein neuer Termin veröffentlicht!");
+    } else {
+        prefix += &format!(
+            "” ({full_court_name}) wurden {} neue Termine veröffentlicht!",
+            items.len()
+        );
+    }
 
-    Some(result)
+    let mut pages = Paginator::new(20, 4096, "\n\n".into());
+
+    pages.push(prefix).unwrap();
+    for item in items {
+        pages
+            .push(item)
+            .unwrap_or_else(|_| pages.push("[Eintrag zu lang]".into()).unwrap());
+    }
+    return pages.get_pages().collect();
 }
 
 pub fn help() -> MarkdownString {

@@ -57,6 +57,17 @@ impl Database {
         Ok(Some(id))
     }
 
+    pub async fn migrate_chat_id(&self, old_chat: ChatId, new_chat: ChatId) -> Result<(), Error> {
+        query!(
+            "UPDATE subscriptions SET chat_id = ? WHERE chat_id = ?",
+            new_chat.0,
+            old_chat.0
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
     pub async fn get_subscription_by_id(
         &self,
         subscription_id: i64,

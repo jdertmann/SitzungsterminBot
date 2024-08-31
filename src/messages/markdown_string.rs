@@ -66,6 +66,10 @@ impl MarkdownString {
         MarkdownString(String::new(), 0)
     }
 
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
     pub fn from_str(s: &str) -> MarkdownString {
         MarkdownString(md::escape(s), s.len())
     }
@@ -94,5 +98,20 @@ impl MarkdownString {
     #[allow(unused)]
     pub fn len_parsed(&self) -> usize {
         self.1
+    }
+
+    pub fn join<'a>(
+        items: impl IntoIterator<Item = &'a MarkdownString>,
+        sep: &MarkdownString,
+    ) -> MarkdownString {
+        let mut result = MarkdownString::new();
+        for (index, item) in items.into_iter().enumerate() {
+            if index > 0 {
+                result += sep;
+            }
+            result += item;
+        }
+
+        result
     }
 }

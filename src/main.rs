@@ -1,14 +1,13 @@
 mod courts;
 mod database;
 mod messages;
-mod reply_queue;
 mod scraper;
 
 use std::sync::Arc;
 
 use courts::Courts;
 use dptree::deps;
-use teloxide::adaptors::DefaultParseMode;
+use teloxide::adaptors::{DefaultParseMode, Throttle};
 use teloxide::macros::BotCommands;
 use teloxide::prelude::*;
 use teloxide::types::{ParseMode, ReplyParameters};
@@ -96,7 +95,23 @@ enum Command {
     },
 }
 
-type Bot = DefaultParseMode<teloxide::Bot>;
+type Bot = DefaultParseMode<Throttle<teloxide::Bot>>;
+
+async fn send_chain(bot: &Bot, chat_id: ChatId, messages: Vec<MarkdownString>) {
+    let mut reply_to = None;
+    for msg in messages {
+        let mut request = bot.send_message(chat_id, msg.into_string());
+        if let Some(reply_to) = reply_to {
+            request = request.reply_parameters(ReplyParameters::new(reply_to));
+        }
+        match request.await {
+            Ok(m) => reply_to = Some(m.id),
+            Err(e) => {
+                log::warn!("error sending message: {e}")
+            }
+        }
+    }
+}
 
 async fn answer(
     bot: Bot,
@@ -109,22 +124,20 @@ async fn answer(
 
     let reply_fn = || {
         let bot = bot.clone();
-        move |reply: MarkdownString| async move {
-            let r = bot
-                .send_message(msg.chat.id, reply.to_string())
-                .reply_parameters(ReplyParameters::new(msg.id))
-                .send()
-                .await;
-
-            if let Err(e) = r {
-                log::warn!("Couldn't send message: {e}");
+        let msg = msg.clone();
+        move |reply: Vec<MarkdownString>| {
+            let bot = bot.clone();
+            let msg = msg.clone();
+            async move {
+                let chat_id = msg.chat.id;
+                send_chain(&bot, chat_id, reply).await;
             }
         }
     };
 
     macro_rules! reply_and_return {
         ($reply:expr) => {{
-            bot.send_message(msg.chat.id, $reply.to_string())
+            bot.send_message(msg.chat.id, MarkdownString::from($reply).to_string())
                 .reply_parameters(ReplyParameters::new(msg.id))
                 .send()
                 .await?;
@@ -170,15 +183,16 @@ async fn answer(
             reply_and_return!(reply)
         }
         Command::ListSubscriptions => {
-            let reply = match database.get_subscriptions_by_chat(msg.chat.id).await {
-                Ok(subs) => messages::list_subscriptions(&subs),
+            match database.get_subscriptions_by_chat(msg.chat.id).await {
+                Ok(subs) => {
+                    let msgs = messages::list_subscriptions(&subs);
+                    reply_fn()(msgs).await;
+                }
                 Err(e) => {
                     log::error!("Database error: {e}");
-                    messages::internal_error()
+                    reply_and_return!(messages::internal_error());
                 }
             };
-
-            reply_and_return!(reply)
         }
         Command::Unsubscribe { name } => {
             let reply = match database.remove_subscription(msg.chat.id, &name).await {
@@ -209,10 +223,13 @@ async fn main() {
     env_logger::init();
     log::info!("Starting bot...");
 
-    let bot = teloxide::Bot::from_env().parse_mode(ParseMode::MarkdownV2);
+    let (bot, bot_worker) = Throttle::new(teloxide::Bot::from_env(), Default::default());
+    let bot = bot.parse_mode(ParseMode::MarkdownV2);
     let database_url = std::env::var("DATABASE_URL").unwrap();
     let database = Database::new(&database_url).await.unwrap();
     let courts = Arc::new(Mutex::new(Courts::new(bot.clone(), database.clone()).await));
+
+    let bot_handle = tokio::spawn(bot_worker);
 
     Dispatcher::builder(
         bot,
@@ -230,5 +247,8 @@ async fn main() {
     let Ok(courts) = Arc::try_unwrap(courts) else {
         panic!("Weird Arc<Courts> flying around")
     };
-    courts.into_inner().shutdown().await;
+    drop(courts.into_inner());
+
+    // This will finish once all instances of bot are dropped
+    bot_handle.await.unwrap();
 }
