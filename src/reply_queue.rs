@@ -11,14 +11,21 @@ use crate::Bot;
 pub struct ReplyQueue(mpsc::UnboundedSender<(ChatId, MarkdownString)>);
 
 impl ReplyQueue {
-    async fn send(bot: &Bot, chat_id: ChatId, msg: MarkdownString) {
-        let result = bot
-            .send_message(chat_id, msg.to_string())
-            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-            .await;
+    async fn send(bot: &Bot, mut chat_id: ChatId, msg: MarkdownString) {
+        for _ in 0..3 {
+            let result = bot
+                .send_message(chat_id, msg.to_string())
+                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .await;
 
-        if let Err(e) = result {
-            log::warn!("Couldn't send message to {chat_id}: {e}")
+            if let Err(e) = result {
+                log::warn!("Couldn't send message to {chat_id}: {e}");
+                match e {
+                    teloxide::RequestError::RetryAfter(s) => tokio::time::sleep(s.duration()).await,
+                    teloxide::RequestError::MigrateToChatId(c) => { chat_id = c },
+                    _ => tokio::time::sleep(Duration::from_millis(500)).await,
+                }
+            }
         }
     }
 
