@@ -105,7 +105,11 @@ async fn send_chain(bot: &Bot, chat_id: ChatId, messages: Vec<MarkdownString>) {
             request = request.reply_parameters(ReplyParameters::new(reply_to));
         }
         match request.await {
-            Ok(m) => reply_to = Some(m.id),
+            Ok(m) => {
+                if reply_to.is_none() {
+                    reply_to = Some(m.id)
+                }
+            }
             Err(e) => {
                 log::warn!("error sending message: {e}")
             }
