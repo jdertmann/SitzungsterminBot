@@ -290,7 +290,7 @@ pub fn sessions_updated(
         .map(session_info)
         .collect();
 
-    if items.len() == 0 {
+    if items.is_empty() {
         return vec![];
     }
 
@@ -314,7 +314,7 @@ pub fn sessions_updated(
             .push(item)
             .unwrap_or_else(|_| pages.push("[Eintrag zu lang]".into()).unwrap());
     }
-    return pages.get_pages().collect();
+    pages.get_pages().collect()
 }
 
 pub fn help() -> MarkdownString {
