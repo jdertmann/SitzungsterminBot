@@ -198,17 +198,12 @@ impl Database {
     pub async fn get_sessions(
         &self,
         court_name: &str,
-        reference_filter: Option<&str>,
         date_filter: Option<NaiveDate>,
     ) -> Result<Vec<Session>, Error> {
         let mut query = QueryBuilder::new(
             "SELECT date,time,type,lawsuit,hall,reference,note FROM sessions WHERE court = ",
         );
         query.push_bind(court_name);
-
-        if let Some(reference) = reference_filter {
-            query.push(" AND reference LIKE  ").push_bind(reference);
-        }
 
         if let Some(date) = date_filter {
             query.push(" AND date = ").push_bind(date.to_string());

@@ -53,7 +53,7 @@ macro_rules! handle_db_error {
 
 impl CourtWorker {
     async fn process_new_data(&mut self, new_data: &CourtData) -> Result<(), DbError> {
-        let old_sessions = self.database.get_sessions(&self.name, None, None).await?;
+        let old_sessions = self.database.get_sessions(&self.name, None).await?;
         let subscriptions = self
             .database
             .get_confirmed_subscriptions_by_court(&self.name)
@@ -122,10 +122,7 @@ impl CourtWorker {
             return Ok(None);
         };
 
-        let sessions = self
-            .database
-            .get_sessions(&self.name, None, date_filter)
-            .await?;
+        let sessions = self.database.get_sessions(&self.name, date_filter).await?;
 
         let court_data = CourtData {
             full_name,
