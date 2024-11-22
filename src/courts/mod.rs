@@ -74,7 +74,7 @@ impl Courts {
         this
     }
 
-    pub async fn init_subscribed_courts(&mut self) {
+    async fn init_subscribed_courts(&mut self) {
         match self.database.get_subscribed_courts().await {
             Ok(names) => {
                 for name in names {
