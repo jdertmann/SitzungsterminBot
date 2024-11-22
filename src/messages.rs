@@ -102,7 +102,7 @@ impl ReferenceFilter {
 }
 
 pub fn session_info(entry: &Session) -> MarkdownString {
-    let datetime = format!("{}, {}", entry.date.format("%A, %-d. %B %C%y"), entry.time);
+    let datetime = format!("{}, {}", entry.date.format_localized("%A, %-d. %B %C%y",chrono::Locale::de_DE), entry.time);
 
     let byline = if entry.lawsuit.is_empty() {
         entry.r#type.clone()
