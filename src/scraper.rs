@@ -65,8 +65,8 @@ async fn parse_index_page(
 
     let document = Html::parse_document(&html);
 
-    if let Some(error) = document.errors.first() {
-        return Err(Error::ParseError(error.clone()));
+    for error in &document.errors {
+        log::info!("Parser error: {error}");
     }
 
     let full_name = document
@@ -130,8 +130,8 @@ async fn parse_table(
     let html = result.text().await?;
     let document = Html::parse_document(&html);
 
-    if let Some(error) = document.errors.first() {
-        return Err(Error::ParseError(error.clone()));
+    for error in &document.errors {
+        log::info!("Parser error: {error}");
     }
 
     let entries: Vec<_> = document
